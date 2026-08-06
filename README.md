@@ -26,14 +26,18 @@ submission, before anyone had voted
 Three ways to post good offline numbers and be worthless in production. Full argument for
 each in [`docs/design.md`](docs/design.md).
 
-**Target leakage: training on the answer.** `score` is the thing being predicted, so it is
-the target and never an input. Using it as one is reading the answer off the back of the
-card. Two more columns are just as illegal and easier to miss: `descendants`, the comment
-count on the post, and `kids`, the list of ids of its direct replies. Both only exist once
-people have reacted, so neither is knowable at submission. The defence is an allowlist in
+**Target leakage: training on the answer.** The score is the thing being predicted, so it
+is the target and never an input. Using it as one is reading the answer off the back of
+the card. Two more fields are just as illegal and easier to miss: the comment count and
+the reply ids. Both only exist once people have reacted, so neither is knowable at
+submission. The defence is an allowlist in
 [`features/schema.py`](src/hn_upvotes/features/schema.py) rather than a blocklist, so a
-column nobody approved is rejected by default. The legal feature set is exactly `title`,
-`by`, `url`, `time`.
+column nobody approved is rejected by default. The legal feature set is the title, the
+author, the url and the timestamp.
+
+Column names come from Hacker News's own API and are kept as it spells them, so the
+comment count is `descendants`, the reply ids are `kids`, and the author is `by`. They
+read oddly because they are inherited, not chosen here.
 
 **Temporal leakage: testing on the past using the future.** A random split puts posts from
 2025 in the training set and posts from 2019 in the test set, so the model scores well on
@@ -86,6 +90,18 @@ the simple ones, this README will say so.
 | 5 | Early, late and hybrid fusion, plus ablations | Not started |
 | 6 | FastAPI and Docker | Not started |
 | 7 | Results write-up | Not started |
+
+## Getting started
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+make check
+```
+
+Heavy dependencies are optional extras, installed with `pip install -e ".[data]"` and so
+on for `train` and `serve`.
 
 ## Repository layout
 

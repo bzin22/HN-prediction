@@ -4,15 +4,30 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 ## Toolchain
 
-`uv` only. Python is pinned to 3.12 in `.python-version` and `pyproject.toml` requires
-`>=3.12,<3.13`. Do not run this on the 3.13 installed on the dev machine. `make help`
-lists every target; `make check` is exactly what CI runs.
+Plain `venv` and `pip`, no uv. `make setup` builds `.venv` and installs `-e ".[dev]"`.
+`make help` lists every target; `make check` is exactly what CI runs. There is no lock
+file: `uv.lock` was removed with uv, so installs resolve fresh. Add a `requirements.txt`
+from `pip freeze` if that becomes a problem.
 
-Heavy dependencies are optional extras (`data`, `train`, `serve`), so the default
-`uv sync` has no torch. Modules under `embeddings/`, `models/`, `training/` and
-`serving/` import their extra at module level and will not import without it. Keep
-`src/hn_upvotes/__init__.py` free of submodule imports so `import hn_upvotes` stays
-cheap and dependency free.
+`requires-python` is `>=3.12`. CI tests 3.12 because that is the supported floor, and
+`.python-version` says 3.13 because that is the dev machine. Both ends get exercised. The
+old `<3.13` cap existed because torch and gensim lagged; both cleared 3.13 by 2026-08-06.
+
+Heavy dependencies are optional extras (`data`, `train`, `serve`), so a default install
+has no torch. `dev` is a normal extra rather than a dependency group, because dependency
+groups are a uv concept that pip cannot install. Modules under `embeddings/`, `models/`,
+`training/` and `serving/` import their extra at module level and will not import without
+it. Keep `src/hn_upvotes/__init__.py` free of submodule imports so `import hn_upvotes`
+stays cheap and dependency free.
+
+## Column names are Hacker News's, not ours
+
+`descendants` is the comment count, `kids` is the list of reply ids, `by` is the author.
+They are the upstream API's own field names, confirmed against
+`https://hacker-news.firebaseio.com/v0/item/8863.json`, and the code keeps them so the
+schema matches the source. When writing prose, use the plain English name and say the raw
+name is Hacker News's own. Do not rename these columns casually: `by` is on the feature
+allowlist, which is a protected invariant, so a rename is its own reviewed change.
 
 ## Two invariants that are not conventions
 

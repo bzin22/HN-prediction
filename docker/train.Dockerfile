@@ -9,23 +9,18 @@
 FROM python:3.12-slim AS base
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
-
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# Dependencies first, so a source edit does not re-resolve the environment.
-COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-install-project --extra data --extra train
+# Dependencies first, so a source edit does not reinstall the whole environment. The
+# src/ copy is deferred, so this layer caches on pyproject.toml alone.
+COPY pyproject.toml README.md ./
+RUN mkdir -p src/hn_upvotes && touch src/hn_upvotes/__init__.py \
+    && pip install --no-cache-dir -e ".[data,train]"
 
 COPY src/ src/
 COPY configs/ configs/
-RUN uv sync --frozen --extra data --extra train
-
-ENV PATH="/app/.venv/bin:$PATH"
 
 ENTRYPOINT ["python", "-m"]
 CMD ["hn_upvotes.training.loop"]
