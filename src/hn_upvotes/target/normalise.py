@@ -12,18 +12,23 @@ submitted. Two rules make it usable at inference time as well as in a backtest:
 * **Settling lag.** Rows from the last ``lag`` are excluded as well, because a post from
   three hours ago is still collecting votes and its score is not final.
 
-Defaults are a 30 day window and a 48 hour lag. Both are configuration, not constants,
-because Phase 1 measures how long a score actually takes to settle and sets the real lag
-from that measurement.
+**Phase 1 found the drift this machinery exists to remove, and found that this machinery
+cannot see it.** Era drift is real and it lives in the tail: the 99th percentile of raw
+score went from 38 points in 2007 to 355 in 2025. Over the same span the median of
+``log1p(score)`` did not move at all and the standard deviation moved 2.9%. An affine
+correction fitted to a flat location and a flat scale leaves the tail where it was, so
+switching this on would not have corrected the drift.
 
-``BaselineConfig.scale`` switches the divide-by-spread step off. With ``scale=False`` the
-transform is a plain subtraction of the trailing centre, which is what Phase 1 will use
-if only the centre of the distribution drifts and the spread does not. Removing the
-mechanism entirely means setting ``centre="zero"`` and ``scale=False``, which reduces the
-forward transform to ``log1p(score)``.
+The defaults are therefore ``centre="zero"`` and ``scale=False``, and the forward
+transform reduces to plain ``log1p(score)``. Each default carries the measurement that
+set it. The window stays 30 days and the lag is 24 hours, down from 48.
+
+The machinery is kept, not deleted. It is one config change to turn back on and the
+trailing window is still what the author and domain statistics use. Tail drift remains
+unhandled and is an open risk for Phase 2. See ``docs/design.md``.
 
 Nothing here is a stub. ``tests/test_target_normalise.py`` covers the round trip and the
-strictly-earlier rule.
+strictly-earlier rule, and ``tests/test_baseline_defaults.py`` pins the measured values.
 """
 
 from __future__ import annotations
@@ -65,9 +70,35 @@ class BaselineConfig:
     """
 
     window: timedelta = timedelta(days=30)
-    lag: timedelta = timedelta(hours=48)
-    centre: Centre = "mean"
-    scale: bool = True
+
+    # Gate 3, measured. Live scores were read for 13,852 stories at one instant
+    # (2026-08-06 06:22 UTC) and bucketed by age. Balanced across UTC hour of day, mean
+    # log1p(score) is 1.490 [1.377, 1.603] for stories under 12 hours old, against a
+    # settled reference of 1.683 [1.656, 1.712]. The 12 to 24 hour band is 1.733
+    # [1.662, 1.816], which already overlaps the reference. Scores arrive at their final
+    # level between 12 and 24 hours; 24 is the top of that interval. Was 48 hours.
+    lag: timedelta = timedelta(hours=24)
+
+    # Gate 1, measured. Median log1p(score) per year takes exactly one value,
+    # 1.0986 = log1p(2), for every year from 2007 to 2024. 2025 is the single exception,
+    # at log1p(3). That flatness is largely a floor artefact: 57.6% of stories score 1 or
+    # 2, so the median is pinned there whatever happens above it. It is not evidence that
+    # scoring is stable. It does establish there is no centre for a trailing subtraction
+    # to remove, so centring is off. Was "mean".
+    centre: Centre = "zero"
+
+    # Gate 2, measured. Over 2010-2025 the standard deviation of log1p(score) moves
+    # 1.1386 to 1.1721, which is 2.9%, and the interquartile range moves the other way,
+    # 1.2528 to 0.8473 with a year correlation of -0.098. Two spread measures disagreeing
+    # in sign means neither tracks a real trend. The drift is in the tail, where neither
+    # can reach it: the 99th percentile of raw score moved 9.3x over the same span.
+    # Was True.
+    scale: bool = False
+
+    # Unused while scale is False. Kept as "std" because it is the one to re-enable if a
+    # later phase finds drift: the IQR of log1p(score) is pinned by the floor spike
+    # (57.6% of stories score 1 or 2, so the 25th percentile is log1p(1) in every year)
+    # and measures the floor rather than the spread.
     spread: Spread = "std"
     min_periods: int = 30
     fallback_centre: float = 0.0

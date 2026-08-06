@@ -82,7 +82,12 @@ def test_the_settling_lag_excludes_recent_rows():
     )
     scores = pd.Series([10, 10, 10, 100_000, 7])
 
-    config = BaselineConfig(window=timedelta(days=30), lag=timedelta(hours=48), min_periods=1)
+    # centre="mean" is set explicitly because this test is about which rows land in the
+    # window, not about the default. Phase 1 measured no centre drift and turned
+    # centring off by default, which would zero the statistic this test reads.
+    config = BaselineConfig(
+        window=timedelta(days=30), lag=timedelta(hours=48), min_periods=1, centre="mean"
+    )
     baseline = compute_trailing_baseline(times, scores, config)
 
     # Only the three rows at 10 points qualify, so the centre is log1p(10) = 2.3979.
@@ -102,7 +107,10 @@ def test_rows_outside_the_window_are_excluded():
     )
     scores = pd.Series([100_000, 10, 7])
 
-    baseline = compute_trailing_baseline(times, scores, BaselineConfig(min_periods=1))
+    # centre="mean" for the same reason as above: the subject is the window bound.
+    baseline = compute_trailing_baseline(
+        times, scores, BaselineConfig(min_periods=1, centre="mean")
+    )
     assert baseline.centre[-1] == pytest.approx(np.log1p(10.0))
     assert baseline.n_prior[-1] == 1
 

@@ -1,47 +1,65 @@
 .DEFAULT_GOAL := help
-UV ?= uv
+
+# Plain venv and pip. PYTHON is the interpreter used to create .venv; override it to
+# build against a different version, for example `make setup PYTHON=python3.12`.
+PYTHON ?= python3
+VENV ?= .venv
+BIN := $(VENV)/bin
+PIP := $(BIN)/python -m pip
 
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
+$(BIN)/python:
+	$(PYTHON) -m venv $(VENV)
+	$(PIP) install --upgrade pip
+
 .PHONY: setup
-setup: ## Create the environment on Python 3.12
-	$(UV) sync
+setup: $(BIN)/python ## Create .venv and install the project plus dev tools
+	$(PIP) install -e ".[dev]"
 
 .PHONY: setup-all
-setup-all: ## Environment plus the data, train and serve extras
-	$(UV) sync --extra data --extra train --extra serve
+setup-all: $(BIN)/python ## Everything, including the data, train and serve extras
+	$(PIP) install -e ".[dev,data,train,serve]"
 
 .PHONY: test
 test: ## Run the test suite
-	$(UV) run pytest -v
+	$(BIN)/pytest -v
 
 .PHONY: lint
 lint: ## Check formatting and lint rules
-	$(UV) run ruff check
-	$(UV) run ruff format --check
+	$(BIN)/ruff check
+	$(BIN)/ruff format --check
 
 .PHONY: fmt
 fmt: ## Apply formatting and autofixable lint rules
-	$(UV) run ruff format
-	$(UV) run ruff check --fix
+	$(BIN)/ruff format
+	$(BIN)/ruff check --fix
 
 .PHONY: check
 check: lint test ## Everything CI runs
 
 .PHONY: ingest
 ingest: ## Phase 1. Build the stories table from the Parquet dump
-	$(UV) run --extra data python -m hn_upvotes.data.ingest
+	$(BIN)/python -m hn_upvotes.data.ingest
+
+.PHONY: clean-shards
+clean-shards: ## Phase 1. Delete the monthly shards. Safe once ingest reports its count
+	rm -rf data/shards
+
+.PHONY: notebook
+notebook: ## Phase 1. Re-execute the EDA notebook in place, outputs and all
+	$(BIN)/jupyter execute --inplace notebooks/01-eda.ipynb
 
 .PHONY: train-embeddings
 train-embeddings: ## Phase 3. Train one word2vec objective
-	$(UV) run --extra train python -m hn_upvotes.embeddings.train
+	$(BIN)/python -m hn_upvotes.embeddings.train
 
 .PHONY: serve
 serve: ## Phase 6. Run the prediction service locally
-	$(UV) run --extra serve uvicorn hn_upvotes.serving.app:app --reload --port 8000
+	$(BIN)/uvicorn hn_upvotes.serving.app:app --reload --port 8000
 
 .PHONY: docker-train
 docker-train: ## Build the training image
@@ -55,3 +73,7 @@ docker-serve: ## Build the serving image
 clean: ## Remove caches and build output
 	rm -rf .pytest_cache .ruff_cache build dist
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +
+
+.PHONY: clean-venv
+clean-venv: ## Remove the virtual environment
+	rm -rf $(VENV)

@@ -3,7 +3,7 @@ name = "hn-upvotes"
 version = "0.1.0"
 description = "Predict Hacker News scores from submission-time information only."
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "numpy>=1.26",
@@ -13,11 +13,21 @@ dependencies = [
 # Heavy dependencies are optional so the scaffold, the feature allowlist, and the
 # target transform can be installed and tested without a 2 GB torch download.
 [project.optional-dependencies]
-data = ["duckdb>=1.0", "pyarrow>=16"]
+# matplotlib and the notebook tooling live here, so `pip install -e ".[data]"` is the
+# single entry point for Phase 1: ingest, the gate plots, and notebooks/01-eda.ipynb.
+data = [
+    "duckdb>=1.0",
+    "pyarrow>=16",
+    "matplotlib>=3.9",
+    "ipykernel>=6.29",
+    "nbformat>=5.10",
+    "nbclient>=0.10",
+]
 train = ["torch>=2.3", "scikit-learn>=1.5", "gensim>=4.3", "tqdm>=4.66"]
 serve = ["fastapi>=0.111", "pydantic>=2.7", "uvicorn>=0.30"]
 
-[dependency-groups]
+# A normal extra rather than a [dependency-groups] entry, because dependency groups are
+# a uv concept and pip cannot install them. `pip install -e ".[dev]"` is the entry point.
 dev = ["pytest>=8.2", "ruff>=0.5"]
 
 [build-system]
