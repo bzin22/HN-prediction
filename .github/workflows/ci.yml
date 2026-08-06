@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # 3.12, not the 3.13 on the development machine. Parts of the ML stack are still
+      # patchy on 3.13 and the repo should not fight its toolchain.
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync environment
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Format check
+        run: uv run ruff format --check
+
+      - name: Import check
+        run: uv run python -c "import hn_upvotes; print(hn_upvotes.__version__)"
+
+      - name: Test
+        run: uv run pytest -v

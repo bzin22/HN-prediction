@@ -1,0 +1,46 @@
+# Defaults for the whole pipeline. Nothing here has been validated against data yet.
+# Phase 1 replaces the target settings with measured values, or removes them.
+
+data:
+  source: open-index/hacker-news
+  licence: odc-by
+  # Row count goes here after ingest. The brief's "12 million posts" is a different
+  # snapshot and is not repeated.
+  expected_usable_rows: null
+
+target:
+  # target = (log1p(score) - centre) / spread, over a trailing window.
+  window_days: 30
+  # Settling lag. A post from a few hours ago is still gaining votes. Phase 1 measures
+  # how long a score actually takes to settle and replaces this.
+  lag_hours: 48
+  centre: mean          # mean | median | zero
+  scale: true           # false subtracts the centre without dividing
+  spread: std           # std | iqr
+  min_periods: 30
+
+splits:
+  # Walk forward. No random splits anywhere.
+  train_window_days: 730
+  test_window_days: 90
+  step_days: 90
+
+features:
+  author:
+    min_posts_for_embedding: 5
+    min_posts_for_statistic: 3
+    embedding_dimension: 32
+  domain:
+    min_posts_for_embedding: 20
+    min_posts_for_statistic: 5
+    embedding_dimension: 32
+  pooling: mean         # mean | sif
+
+training:
+  epochs: 20
+  batch_size: 512
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  loss: mse             # switch to huber if the residuals come out heavy tailed
+  early_stopping_patience: 3
+  seeds: [0, 1, 2, 3, 4]

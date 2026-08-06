@@ -1,0 +1,32 @@
+# Environments
+.venv/
+venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Data and artefacts. Nothing large is ever committed.
+# Anchored to the repo root, or `data/` would also swallow src/hn_upvotes/data/.
+/data/
+/artifacts/
+/runs/
+/corpora/
+*.parquet
+*.zst
+*.npy
+*.pt
+*.bin
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
