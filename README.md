@@ -21,47 +21,20 @@ serve as labels; the rest fall in months where the archive recorded the score at
 submission, before anyone had voted
 ([why](docs/design.md#scores-that-are-not-final)).
 
-## The three failure modes
-
-Three ways to post good offline numbers and be worthless in production. Full argument for
-each in [`docs/design.md`](docs/design.md).
-
-**Target leakage: training on the answer.** The score is the thing being predicted, so it
-is the target and never an input. Using it as one is reading the answer off the back of
-the card. Two more fields are just as illegal and easier to miss: the comment count and
-the reply ids. Both only exist once people have reacted, so neither is knowable at
-submission. The defence is an allowlist in
-[`features/schema.py`](src/hn_upvotes/features/schema.py) rather than a blocklist, so a
-column nobody approved is rejected by default. The legal feature set is the title, the
-author, the url and the timestamp.
-
-Column names come from Hacker News's own API and are kept as it spells them, so the
-comment count is `descendants`, the reply ids are `kids`, and the author is `by`. They
-read oddly because they are inherited, not chosen here.
-
-**Temporal leakage: testing on the past using the future.** A random split puts posts from
-2025 in the training set and posts from 2019 in the test set, so the model scores well on
-2019 partly because it has already seen how 2025 turned out. No submission-time predictor
-could, and the reported number is not achievable in production. The defence is that there
-are no random splits anywhere: validation is walk-forward, and every rolling statistic is
-computed from rows strictly earlier than the row it serves.
-
-**Era drift: the ruler moves.** Scoring inflation shows up in the top 1% of posts, where
-the 99th percentile went from 38 points in 2007 to 355 in 2025, while the typical post did
-not move. The trailing z-score transform the project was built around was switched off,
-because its statistics cannot see the tail
-([detail](docs/design.md#what-phase-1-measured)).
-
 ## Phase 1 gate results
 
-The centre and spread of the score distribution do not drift, so the target transform came
-out and the training target is now plain `log1p(score)`. A score reaches its final value
-between 12 and 24 hours after submission, measured from a live read of 13,852 posts. That
-covers 4,738,004 usable stories.
+Scoring inflation is real and it sits in the top 1% of posts. The 99th percentile went
+from 38 points in 2007 to 355 in 2025, while the typical post did not move. The trailing
+z-score transform the project was built around was switched off, because the statistics it
+corrects, the centre and the spread, cannot see the tail
+([detail](docs/design.md#what-phase-1-measured)). The training target is now plain
+`log1p(score)`.
+
+A score reaches its final value between 12 and 24 hours after submission, measured from a
+live read of 13,852 posts.
 
 Three defaults in [`target/normalise.py`](src/hn_upvotes/target/normalise.py) changed.
-The measurements behind each, with the plots, are in
-[`docs/design.md`](docs/design.md#what-phase-1-measured) and
+Every measurement behind them, with the plots, is in that design doc section and in
 [`notebooks/01-eda.ipynb`](notebooks/01-eda.ipynb).
 
 | Default | Was | Now |
@@ -70,15 +43,7 @@ The measurements behind each, with the plots, are in
 | `scale` | `True` | `False` |
 | `lag` | 48 h | 24 h |
 
-## What Phase 2 does
-
-Phase 2 builds the simple models that any fancier model has to beat, from predicting the
-recent average up to TF-IDF with gradient boosting, and the walk-forward harness, which
-trains on one time window and tests on the next so a result is quotable rather than an
-artefact of where the split landed. It is also where tail drift gets confronted: Spearman
-correlation and precision-at-100 both measure ranking in the region the drift lives in, so
-they are the metrics that will expose it. If the neural models in later phases do not beat
-the simple ones, this README will say so.
+## Phases
 
 | Phase | Deliverable | State |
 |---|---|---|
