@@ -4,11 +4,19 @@ Each gate answers one question and each answer changes a default in
 ``target/normalise.BaselineConfig``. A gate that produces a plot and changes nothing
 has not been finished.
 
-1. Does the centre of ``log1p(score)`` drift by year? If it is flat, the target
-   transform is unjustified and reduces to plain ``log1p(score)``.
+1. Does the centre of ``log1p(score)`` drift by year? If it is flat, there is no centre
+   for the transform to subtract.
 2. Does the spread drift too? If only the centre moves, subtract a trailing median and
    do not divide.
 3. How long does a score take to settle? This sets ``BaselineConfig.lag``.
+
+Gates 1 and 2 both came back flat, and both are measured on statistics that the floor
+spike pins: 57.6% of stories score 1 or 2. A flat answer here means the transform has
+nothing to correct, **not** that scoring is stable. It is not. The 99th percentile of raw
+score went from 38 points in 2007 to 355 in 2025, which is why
+:func:`plot_score_distribution` and the per-percentile table in ``docs/design.md`` are
+part of the result rather than colour. Tail drift is unhandled and is an open risk for
+Phase 2.
 
 Gate 3 needs one instant at which many posts of many ages had their scores read. The
 brief's plan was to use ``committed_at`` from the dataset's ``stats.csv``, on the premise

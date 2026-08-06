@@ -32,14 +32,25 @@ These are enforced by tests. Do not weaken either to make something pass.
 Read the design doc before changing the target transform, the tokeniser, or the embedding
 hyperparameters.
 
-**Era drift was measured in Phase 1 and mostly is not there.** Median `log1p(score)` is
-`log1p(2)` in every year from 2007 to 2024, and the standard deviation moves 2.9% across
-2010-2025. So `BaselineConfig` now defaults to `centre="zero"`, `scale=False`, and the
-training target is plain `log1p(score)`. The machinery is kept and is one config change
-to re-enable. What does drift is the extreme tail (99th percentile of raw score 38 in
-2007, 355 in 2025), which no centre or spread statistic captures. Do not describe the
-transform as justified by drift, and do not re-enable it without a statistic that
-measures the tail.
+**Era drift is real and it is in the tail. Phase 1 measured it. Do not write that it was
+refuted.** The 99th percentile of raw score went from 38 points in 2007 to 355 in 2025,
+and the 99.9th from 89 to 1,001.
+
+The four statistics a trailing transform can use are all blind to that. Median
+`log1p(score)` is `log1p(2)` in every year from 2007 to 2024, the standard deviation
+moves 2.9% across 2010-2025, and the IQR moves the other way. The flat median is largely
+a floor artefact: 57.6% of stories score 1 or 2, so it is pinned there whatever happens
+above it. Never cite the flat median as evidence that scoring is stable.
+
+So `BaselineConfig` defaults to `centre="zero"`, `scale=False` and the target is plain
+`log1p(score)`. The reason is that switching the transform **on** would not have
+corrected the tail either, not that there is nothing to correct. The machinery is kept
+and is one config change to re-enable. Do not re-enable it without a statistic that
+actually tracks the tail.
+
+**Tail drift is an open risk, not a closed finding.** It is unhandled, and Phase 2's
+walk-forward folds are where it has to be dealt with. Spearman and P@100 are the metrics
+that will expose it.
 
 Terminology: CBOW and Skip-gram are training objectives. The embedding is the input
 weight matrix kept after the task is discarded. "CBOW embeddings" is wrong here.

@@ -49,12 +49,15 @@ number.
 Replace `year` with features that mean the same thing in any era: hour of day, day of
 week, and rolling statistics such as how the author has done recently.
 
-**This argument was asserted in Phase 0 and measured in Phase 1. Most of it did not
-survive.** The full result is in the README's gate table; the short version is that the
-centre and the bulk spread of `log1p(score)` do not drift, so the transform came out and
-the target is now plain `log1p(score)`.
+### What Phase 1 measured
 
-What does drift is the extreme tail. Raw score by percentile, 2007 against 2025:
+**The premise above is correct. The fix proposed for it is not.**
+
+Era drift is real. Scoring inflation is concentrated in the tail, and none of the four
+statistics a trailing transform can use will show it: not the mean, not the median, not
+the standard deviation, not the interquartile range.
+
+Raw score by percentile, 2007 against 2025:
 
 | Percentile | 2007 | 2025 | Ratio |
 |---|---|---|---|
@@ -65,17 +68,54 @@ What does drift is the extreme tail. Raw score by percentile, 2007 against 2025:
 | 99th | 38 | 355 | 9.3x |
 | 99.9th | 89 | 1,001 | 11.2x |
 
-The plan's illustration was "a great post in 2011 might have got 50, in 2025 it might
-get 300". For great posts that is close to right: the 99th percentile went from 207 in
-2011 to 355 in 2025 and the 99.9th from 526 to 1,001. For a typical post it is wrong.
-The median has been exactly 2 points every year since 2007.
+Below the 75th percentile nothing moves. Above the 95th everything does. The plan's
+illustration was "a great post in 2011 might have got 50, in 2025 it might get 300". For
+great posts that is close to right: the 99th percentile went from 207 in 2011 to 355 in
+2025 and the 99.9th from 526 to 1,001. For a typical post it is wrong.
 
-This matters for Phase 2 and is not solved by the transform. A trailing z-score removes
-location and scale, and the drift here is in neither: the standard deviation of
-`log1p(score)` moved 2.9% while the 99th percentile of raw score moved 9.3x. A model
-trained on early years and tested on recent ones will mis-rank the tail, which is the
-region worth getting right. Watch it in the walk-forward folds rather than assuming the
-transform handled it.
+Meanwhile the statistics the transform reads do not track it. Median `log1p(score)` is
+`log1p(2)` in every year from 2007 to 2024. The standard deviation moves 1.1386 to 1.1721
+across 2010-2025, which is 2.9%. The IQR moves in the opposite direction, 1.2528 to
+0.8473, with a year correlation of -0.098.
+
+**The flat median is largely an artefact and must not be read as evidence of stability.**
+57.6% of stories score 1 or 2 points. With more than half the distribution on the floor,
+the median is pinned there by construction and would read `log1p(2)` every year whatever
+happened above it. The same spike pins the IQR, whose 25th percentile is `log1p(1)` in
+every year. Eighteen flat years of median is weak evidence about scoring inflation, not
+strong evidence against it.
+
+### Why the transform still comes out
+
+Not because the data is stationary. Because the instrument does not touch the moving
+part.
+
+A trailing z-score is an affine correction fitted to a location and a scale. Here the
+location did not move and the scale moved 2.9%, while the 99th percentile of raw score
+moved 9.3x. Subtracting a centre that is flat and dividing by a spread that is flat
+leaves the tail exactly where it was. **Switching the transform on would not have
+corrected the drift.** It was the wrong instrument for the drift that exists, not the
+right instrument for a drift that does not.
+
+So it is switched off, which costs nothing and removes machinery that would otherwise
+imply the problem had been dealt with. The target is plain `log1p(score)`. The machinery
+stays in the tree behind one config change, in case a later phase finds a statistic that
+does track the tail.
+
+### The residual risk, carried forward
+
+**Tail drift is unhandled.** This is an open problem, not a closed finding.
+
+A model trained on early years and tested on recent ones will mis-rank the tail, and the
+tail is the region a submission-time predictor is for. Nobody needs help telling a
+1-point post from a 2-point post.
+
+Phase 2's walk-forward folds are where this has to be dealt with. Spearman on raw score
+and Precision@100 are the two metrics that will expose it, because both are sensitive to
+ranking in the upper region and neither is flattered by the target transform. If the
+fold-over-fold sequence degrades as it moves forward in time, this is why. Candidate
+responses, none of them yet tested: a trailing high quantile as the scale, rank-space
+targets fitted within a trailing window, or an explicit tail-aware loss.
 
 ## The target transform
 

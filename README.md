@@ -12,6 +12,13 @@ with the author, domain and time signals. Validation is walk-forward on the time
 No model has been trained yet, so the model tables below are empty. The reasoning behind
 every design choice is in [`docs/design.md`](docs/design.md).
 
+The headline result: **era drift is real and the standard fix aims at the wrong
+statistic.** Scoring inflation is concentrated in the tail, where the 99th percentile of
+raw score went from 38 points in 2007 to 355 in 2025. The trailing z-score transform this
+project was built around corrects the mean and the spread, both of which moved under 3%,
+so it was switched off. Handling the tail is
+[an open problem for Phase 2](#the-drift-is-in-the-tail).
+
 ## The data
 
 4,738,004 usable stories, filtered from the 49,119,480 items in
@@ -47,9 +54,16 @@ submitted after the ones it is tested on. Validation is walk-forward, and every 
 statistic is computed from rows strictly earlier than the row it serves.
 
 **Era drift.** The claim was that the same quality of post earns more points now than it
-used to, so a model trained on old data would under-predict new posts. Gate 1 and gate 2
-measured it. Mostly it is not there, and the target transform came out. What is there is
-in the tail, and it is [flagged for Phase 2](docs/design.md#why-not-raw-score).
+used to, so a model trained on old data would under-predict new posts. **The drift is
+real, and it is in the tail.** The 99th percentile of raw score went from 38 points in
+2007 to 355 in 2025, and the 99.9th from 89 to 1,001.
+
+The trailing transform still came out, because it cannot see that. Every statistic it
+subtracts or divides by (mean, median, standard deviation, interquartile range) is blind
+to the tail, so switching it on would not have corrected the drift either. It was the
+wrong instrument for the drift that exists, not the right instrument for a drift that
+does not. **Tail drift is unhandled and is an open risk for
+[Phase 2](docs/design.md#why-not-raw-score).**
 
 The legal feature set is exactly `title`, `by`, `url`, `time`.
 
@@ -61,14 +75,17 @@ Each gate changed a default in
 
 | Question | Answer | What changed |
 |---|---|---|
-| Does the median drift by year? | **No.** Median `log1p(score)` is 1.0986 = `log1p(2)` in every year from 2007 to 2024. 2025 is the only exception, at `log1p(3)` | `centre`: `"mean"` to `"zero"` |
-| Does the spread drift too? | **No.** Standard deviation moves 1.1386 to 1.1721 over 2010-2025, which is 2.9%. The IQR moves the other way, 1.2528 to 0.8473 | `scale`: `True` to `False` |
+| Does the median drift by year? | **No, but the median cannot answer this.** It is 1.0986 = `log1p(2)` in every year from 2007 to 2024, and 57.6% of stories score 1 or 2, so it is pinned to the floor | `centre`: `"mean"` to `"zero"` |
+| Does the spread drift too? | **Not as the transform measures it.** Standard deviation moves 1.1386 to 1.1721 over 2010-2025, which is 2.9%. The IQR moves the other way, 1.2528 to 0.8473 | `scale`: `True` to `False` |
+| Where is the drift, then? | **The tail.** 99th percentile of raw score: 38 points in 2007, 355 in 2025. 99.9th: 89 to 1,001 | Nothing. **Open risk for Phase 2** |
 | How long does a score take to settle? | **Between 12 and 24 hours** | `lag`: 48 h to 24 h |
 | Usable story rows after filtering | **4,738,004**, of which 4,168,189 carry final scores | Snapshot dated 2026-08-05 |
 
-Both transform steps are now off, so the training target is plain `log1p(score)`.
+Both transform steps are now off, so the training target is plain `log1p(score)`. That is
+not because the data is stationary. It is because the transform's statistics cannot see
+the part that moves.
 
-### Gate 1: the centre does not drift
+### Gate 1: the median is flat, and it is pinned
 
 ![Median and mean log1p(score) per year](docs/img/gate1-median-by-year.png)
 
@@ -76,16 +93,56 @@ The median takes exactly one value for eighteen consecutive years: a median scor
 points, every year from 2007 to 2024. The mean wanders in a band between 1.43 and 1.70
 with no trend. 2023 is missing because its archived scores are not final.
 
-### Gate 2: neither does the spread
+**Read the flat line carefully.** 57.6% of stories score 1 or 2 points, so more than half
+the distribution sits on the floor and the median is stuck there by construction. It
+would read `log1p(2)` every year no matter what happened in the upper half. Eighteen flat
+years is weak evidence about scoring inflation, not strong evidence against it.
+
+What the flat median does establish is narrower and still useful: there is no centre for
+a trailing subtraction to remove.
+
+### Gate 2: the spread is flat as the transform measures it
 
 ![Standard deviation and IQR of log1p(score) per year](docs/img/gate2-spread-by-year.png)
 
 The standard deviation moves 2.9% across sixteen years. The interquartile range moves in
 the opposite direction, with a year correlation of -0.098. Two measures of the same
-quantity drifting in opposite directions is what no drift looks like.
+quantity drifting in opposite directions means neither is tracking a real trend.
 
-The IQR is the less trustworthy of the two here, because the floor spike pins it: 57.6%
-of stories score 1 or 2, so the 25th percentile is `log1p(1)` in every single year.
+Both are pulled toward the floor by the same spike. The IQR especially: with 57.6% of
+stories at 1 or 2 points, its 25th percentile is `log1p(1)` in every single year.
+
+So gates 1 and 2 do not say the distribution is stable. They say the four statistics the
+trailing transform can use are stable, which is a different and much weaker statement.
+
+### The drift is in the tail
+
+Raw score by percentile, over settled months:
+
+| Percentile | 2007 | 2025 | Ratio |
+|---|---|---|---|
+| 50th | 2 | 3 | 1.5x |
+| 75th | 6 | 6 | 1.0x |
+| 90th | 13 | 26 | 2.0x |
+| 95th | 19 | 89 | 4.7x |
+| 99th | 38 | 355 | 9.3x |
+| 99.9th | 89 | 1,001 | 11.2x |
+
+Below the 75th percentile, nothing moves. Above the 95th, everything does. The plan's
+illustration was "a great post in 2011 got 50, in 2025 it gets 300"; for great posts that
+is close to right, and for a typical post it is wrong.
+
+**This is the drift the project set out to handle, and the transform does not handle
+it.** The standard deviation of `log1p(score)` moved 2.9% while the 99th percentile of
+raw score moved 9.3x. An affine transform fitted to a statistic that barely moves cannot
+correct a tail that moved by an order of magnitude, so turning it on would not have
+helped. Switching it off costs nothing and removes machinery that would otherwise imply
+the problem was solved.
+
+The residual risk is carried forward, not closed. A model trained on early years and
+tested on recent ones will mis-rank the tail, which is exactly the region a
+submission-time predictor is for. Phase 2's walk-forward folds are where this has to be
+dealt with, and Spearman and P@100 are the metrics that will show it.
 
 ### Gate 3: scores settle between 12 and 24 hours
 
