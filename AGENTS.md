@@ -28,14 +28,36 @@ These are enforced by tests. Do not weaken either to make something pass.
 
 ## Design decisions that are argued, not incidental
 
-Read `README.md` before changing the target transform or the embedding hyperparameters.
-The reasoning is written down there: why the target is a trailing z-score of
-`log1p(score)` rather than raw score, why `year` is not a feature, and where each
-hyperparameter comes from. Era drift is asserted and unmeasured until Phase 1 runs its
-gates, so do not write it up as measured fact.
+`docs/design.md` holds the reasoning; `README.md` holds the results and how to run it.
+Read the design doc before changing the target transform, the tokeniser, or the embedding
+hyperparameters.
+
+**Era drift was measured in Phase 1 and mostly is not there.** Median `log1p(score)` is
+`log1p(2)` in every year from 2007 to 2024, and the standard deviation moves 2.9% across
+2010-2025. So `BaselineConfig` now defaults to `centre="zero"`, `scale=False`, and the
+training target is plain `log1p(score)`. The machinery is kept and is one config change
+to re-enable. What does drift is the extreme tail (99th percentile of raw score 38 in
+2007, 355 in 2025), which no centre or spread statistic captures. Do not describe the
+transform as justified by drift, and do not re-enable it without a statistic that
+measures the tail.
 
 Terminology: CBOW and Skip-gram are training objectives. The embedding is the input
 weight matrix kept after the task is discarded. "CBOW embeddings" is wrong here.
+
+## Sharp edges in the source data
+
+All four are encoded in `data/ingest.py`; the evidence is in `docs/design.md`.
+
+1. **Not every archived score is final.** `UNSETTLED_SCORE_MONTHS` lists 21 months
+   (2022-12 to 2023-12 and 2026-01 to 2026-08, 12.0% of rows) whose `score` was captured
+   at submission. Anything reading `score` as a label must go through
+   `ingest.drop_unsettled_months` first. The archive is live, so this list can grow:
+   re-check it by refetching a monthly sample from the live HN API.
+2. `by` is a reserved word in DuckDB and must be double quoted in every query.
+3. Missing values are sentinels, not `NULL`. An absent title is `''`, an absent score
+   is `0`, so an `IS NOT NULL` filter silently keeps everything.
+4. `time` is `TIMESTAMP_MICROS` in UTC, not unix seconds. Cast with `AT TIME ZONE 'UTC'`
+   or every month boundary shifts.
 
 ## Maintaining this file
 

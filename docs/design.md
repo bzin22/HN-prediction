@@ -1,0 +1,456 @@
+# Design notes
+
+The reasoning behind the choices the [README](../README.md) states. Read this before
+changing the target transform, the tokeniser, or the embedding hyperparameters.
+
+## Contents
+
+- [Why not raw score](#why-not-raw-score)
+- [The target transform](#the-target-transform)
+- [Why a z-score and not a percentile](#why-a-z-score-and-not-a-percentile)
+- [The trailing window and the settling lag](#the-trailing-window-and-the-settling-lag)
+- [The source dump](#the-source-dump)
+- [Tokenisation: the `words` column against ours](#tokenisation-the-words-column-against-ours)
+- [Embeddings](#embeddings)
+- [Fusion architectures](#fusion-architectures)
+- [Evaluation](#evaluation)
+
+## Why not raw score
+
+Hacker News has grown. The same quality of post earns more points now than it did years
+ago, so a model trained on old data systematically under-predicts new posts. It judges
+the post correctly while the ruler moves underneath it.
+
+Train on 2011 and the model learns "great post equals 50 points". Test it on 2025 and it
+says 50 when the answer is 300. Nothing is wrong with its judgement. The units changed.
+
+The obvious fix does not work. Adding `year` as a feature fails under a temporal split.
+Training stops years before the test period, so a tree has no branch for a year it never
+saw. Every test-period post falls into the last training bucket and gets that era's
+numbers. Teaching someone 2011 grocery prices and then telling them "it is 2025 now"
+does not let them price a 2025 shop.
+
+So change the question instead of the features. Stop predicting how many points a post
+gets. Predict how good it is compared to posts from around the same time.
+
+| | Raw points | Compared to peers |
+|---|---|---|
+| Great post, 2011 | 50 | Way above average |
+| Great post, 2025 | 300 | Way above average |
+
+The left column moves with the years. The right column does not. That is why a model
+trained on old data still works on new data.
+
+Points stay the ground truth throughout. The baseline is computed from points, the
+target is computed from points, and the reported prediction converts back to points.
+What changes is that the model predicts a position relative to peers instead of a bare
+number.
+
+Replace `year` with features that mean the same thing in any era: hour of day, day of
+week, and rolling statistics such as how the author has done recently.
+
+**This argument was asserted in Phase 0 and measured in Phase 1. Most of it did not
+survive.** The full result is in the README's gate table; the short version is that the
+centre and the bulk spread of `log1p(score)` do not drift, so the transform came out and
+the target is now plain `log1p(score)`.
+
+What does drift is the extreme tail. Raw score by percentile, 2007 against 2025:
+
+| Percentile | 2007 | 2025 | Ratio |
+|---|---|---|---|
+| 50th | 2 | 3 | 1.5x |
+| 75th | 6 | 6 | 1.0x |
+| 90th | 13 | 26 | 2.0x |
+| 95th | 19 | 89 | 4.7x |
+| 99th | 38 | 355 | 9.3x |
+| 99.9th | 89 | 1,001 | 11.2x |
+
+The plan's illustration was "a great post in 2011 might have got 50, in 2025 it might
+get 300". For great posts that is close to right: the 99th percentile went from 207 in
+2011 to 355 in 2025 and the 99.9th from 526 to 1,001. For a typical post it is wrong.
+The median has been exactly 2 points every year since 2007.
+
+This matters for Phase 2 and is not solved by the transform. A trailing z-score removes
+location and scale, and the drift here is in neither: the standard deviation of
+`log1p(score)` moved 2.9% while the 99th percentile of raw score moved 9.3x. A model
+trained on early years and tested on recent ones will mis-rank the tail, which is the
+region worth getting right. Watch it in the walk-forward folds rather than assuming the
+transform handled it.
+
+## The target transform
+
+```
+target = (log1p(score) - baseline_centre) / baseline_spread
+score  = expm1(target * baseline_spread + baseline_centre)
+```
+
+Both statistics come from a trailing window, so both are available at inference and the
+inverse works in production, not only in a backtest.
+
+A worked example. **These baselines are illustrative, not measured.** They demonstrate
+the mechanism.
+
+| Post | Raw score | `log1p` | Baseline centre | Baseline spread | Target |
+|---|---|---|---|---|---|
+| Strong post, earlier era | 50 | 3.93 | 1.8 | 1.2 | **1.78** |
+| Its later-era equivalent | 183 | 5.21 | 2.9 | 1.3 | **1.78** |
+| A stronger later-era post | 300 | 5.71 | 2.9 | 1.3 | **2.16** |
+
+Row one: `log1p(50) = 3.93`, and `(3.93 - 1.8) / 1.2 = 1.78`.
+Row two: `log1p(183) = 5.21`, and `(5.21 - 2.9) / 1.3 = 1.78`.
+
+The first two rows differ by 3.7x in raw score and are identical in target. That is the
+mechanism working. The third row is a better post than the second and the target says
+so: `(5.71 - 2.9) / 1.3 = 2.16`.
+
+Reporting inverts it. Nobody wants "1.78 above average", they want "about 180 points".
+Train in the ruler-proof space, report in the human one.
+
+## Why a z-score and not a percentile
+
+The z-score is chosen for invariance, not for probability. It is an affine transform, so
+it preserves rank exactly, removes location drift by subtracting, and removes scale
+drift by dividing. No distributional assumption is required for that job.
+
+A z-score only becomes a probability statement under approximate normality, which does
+not hold here. Measured over the 4,168,189 settled stories: 32.9% score exactly 1 and
+24.7% score exactly 2, so **57.6% of all stories sit at 1 or 2 points**. `log1p` is
+monotone, so it cannot spread a point mass: the spike moves to 0.693 and 1.099 and stays
+exactly as tall. Treat any percentile conversion as indicative.
+
+That share also settles the secondary-readout question. Percentile rank is worth
+reporting, but it cannot be the target: with 57.6% of the mass on two values, more than
+half of all stories share one of two percentile ranks, and any ranking inside that block
+is arbitrary.
+
+Percentile rank within the trailing window is the distribution-free alternative, and is
+uniform on `[0,1]` by construction. It is rejected as the training target because it
+flattens the tail: a 500-point post and a 3000-point post both sit near the 99.9th
+percentile, and the tail is the interesting region. Percentile is reported as a
+secondary readout instead.
+
+Separately, squared error is maximum likelihood under Gaussian *residuals*, not a
+Gaussian target. If the Phase 2 residual plot comes out heavy tailed, the loss switches
+to Huber. Those are different claims and only the second one is a reason to change loss.
+
+## The trailing window and the settling lag
+
+The baseline for a row uses rows in `[t - lag - window, t - lag)`. Two rules, both load
+bearing.
+
+**Strictly earlier.** The upper bound is exclusive, so a row can never contribute to its
+own baseline, and neither can anything submitted at the same instant or later. Using the
+post's own calendar month would include posts submitted after it, which nobody could
+know at submission time. That makes test scores fake. A trailing window is always
+finished, always knowable, and behaves the same in testing and in production.
+
+**Settling lag.** A post from three hours ago is still gaining votes. Letting it into
+the baseline drags the centre down with scores that are not final.
+
+The reference implementation of the window bound is
+[`compute_trailing_baseline`](../src/hn_upvotes/target/normalise.py). Every other
+rolling statistic in the project copies its bound.
+
+### How the lag was measured
+
+The dataset publishes `stats.csv`, one row per committed month, with a `committed_at`
+timestamp. That is the instant the month's file was fetched from the HN API, so **every
+score in that file was read at that one moment**. A story's age when its score was
+observed is `committed_at - time`. A story submitted an hour before the fetch is one
+hour old. One submitted on the first of the month is thirty days old. A single monthly
+file therefore holds posts at every age from minutes to a month, and median score
+against age falls out of it directly.
+
+Several recent months are combined so day-of-week and hour-of-day effects average out.
+
+**The caveat, stated plainly: these are different posts at different ages, not the same
+post tracked over time.** If the posts submitted late in a month were systematically
+better or worse than the ones submitted early, that cohort difference would show up in
+the curve and be read as settling. Inside a single month the effect is small, but it is
+real, and it is the reason this is a measurement of a lag rather than of a vote-arrival
+curve.
+
+## The source dump
+
+[`open-index/hacker-news`](https://huggingface.co/datasets/open-index/hacker-news).
+Monthly Parquet files, zstd, licence `odc-by`, read with DuckDB over `hf://` directly.
+
+Layout is `data/YYYY/YYYY-MM.parquet` for committed months plus
+`today/YYYY/MM/DD/HH/MM.parquet` for five-minute live blocks. At midnight UTC the
+current month is refetched from source as one authoritative file and that day's `today/`
+blocks are deleted. **The archive is live.** Every row count in this repo is a snapshot
+and carries its date.
+
+### Four things not in its documentation
+
+Each of these cost time to find and each is now encoded in
+[`data/ingest.py`](../src/hn_upvotes/data/ingest.py).
+
+1. **`by` is a reserved word in DuckDB.** It has to be double quoted in every query, or
+   the parser fails on the column list.
+2. **Missing values are sentinels, not SQL `NULL`.** An absent title is `''` and an
+   absent score is `0`. `count(title)` returns the full row count on a table of
+   comments, so any filter written against `IS NOT NULL` silently keeps everything.
+3. **`time` is `TIMESTAMP_MICROS` in UTC**, not the unix seconds the HN API returns.
+   DuckDB reads it as `TIMESTAMPTZ` and renders it in the session timezone unless it is
+   cast with `AT TIME ZONE 'UTC'`. Get this wrong and every month boundary shifts.
+4. **The column projection is what makes this affordable.** The sixteen columns occupy
+   11.93 GB compressed. `text` is 6.18 GB of that and `words` is 4.67 GB. The eight
+   columns this project needs are 776 MB, and DuckDB pushes the projection into the
+   Parquet reader, so that is what actually crosses the network.
+
+### The `type` encoding
+
+`type` is `int8` and the mapping is not documented upstream. It was derived, not
+guessed. Each code was characterised by which columns it carries, then one id per code
+was fetched from `https://hacker-news.firebaseio.com/v0/item/<id>.json` and its `type`
+string read off. All five agreed.
+
+| Code | Name | Checked id | Shape in the dump |
+|---|---|---|---|
+| 1 | story | 44147768 | title, score, url, no parent |
+| 2 | comment | 44147746 | parent, no title, no score |
+| 3 | poll | 44192767 | title, score, descendants, no url |
+| 4 | pollopt | 44192768 | score, no title, ids follow their poll's |
+| 5 | job | 44169039 | title, url, score of 1, no descendants |
+
+The scaffold's intended shortcut, "stories are the only type with both a title and a
+score", is **false**. Polls and jobs carry both. On `2025-06` the counts among
+title-and-score rows are 31,529 for stories, 46 for jobs and 3 for polls, so
+`find_story_type_code` picks the modal code rather than the only one. Three orders of
+magnitude is a safe margin and it holds in every month checked.
+
+## Tokenisation: the `words` column against ours
+
+The dump ships a pre-tokenised `words` column. Phase 1 compared it against
+[`tokenise`](../src/hn_upvotes/data/preprocess.py) rather than trusting either blindly.
+**The project uses its own tokeniser.** Two reasons, both measured on `2026-06`.
+
+**`words` tokenises `text`, not `title`.** It is populated for 2,474 of the 30,102
+titled stories that month, which is 8.2%. Those are the 2,446 Ask HN posts that have a
+body, plus 28 edge cases where the body was later emptied. A link story with a title and
+a URL has no `words` entry at all, and link stories are 92% of the corpus. The title is
+the one field this project needs tokenised, and `words` does not cover it.
+
+**`words` is a set, not a sequence.** It is sorted alphabetically and deduplicated. CBOW
+and Skip-gram are both defined over a context window, which needs word order. Even where
+`words` exists, it cannot train an embedding.
+
+### Agreement on the input they do share
+
+Over 5,000 rows of `2026-06` that carry both `text` and `words`, comparing `words`
+against `tokenise(normalise_title(text))` as sets:
+
+| Measure | Value |
+|---|---|
+| Micro Jaccard (pooled over all tokens) | 0.899 |
+| Exact set match | 32.9% of rows |
+
+So the two tokenisers broadly agree and the disagreements are systematic, not random.
+Three classes, over the token instances this tokeniser produces and `words` does not:
+
+| Class | Share | What happens |
+|---|---|---|
+| Contractions | 42.1% | `words` splits `don't` into `don` and `t`. This keeps it whole |
+| HTML markup | 34.0% | `words` strips tags first. This does not, so it emits `href`, `rel` and `nofollow` from a comment body |
+| Hyphens | 18.2% | `words` splits `ad-free` into `ad` and `free`. This keeps it whole |
+| Other | 5.7% | |
+
+The hyphen class is the one that matters on Hacker News. `gpt-4`, `self-hosted` and
+`k8s` are single content words, and splitting them throws away the thing that makes the
+title informative.
+
+The HTML class is a genuine weakness of this tokeniser, and it is a weakness on `text`
+only. Titles carry HTML entities, never tags, and `normalise_title` unescapes them. It
+unescapes twice, because the dump contains double-escaped entities such as `&amp;#x27;`
+that one pass leaves as a literal `&#x27;`. If a later phase tokenises `text`, it needs
+a tag-stripping step first.
+
+## Scores that are not final
+
+**Two windows of months record the score at submission instead of after the post
+finished scoring.** Their `score` cannot be used as a label. This was not documented
+upstream and it is not visible without checking against the live API.
+
+Found by refetching 70 stories per month from `/v0/item/<id>.json` and comparing:
+
+| Month | Archived mean | Live mean | Rows identical |
+|---|---|---|---|
+| 2022-11 | 32.30 | 34.39 | 82.9% |
+| 2022-12 | 1.69 | 11.40 | 37.1% |
+| 2023-05 | 2.27 | 11.43 | 38.6% |
+| 2023-11 | 1.46 | 10.46 | 42.0% |
+| 2023-12 | 11.71 | 25.24 | 64.3% |
+| 2024-01 | 22.07 | 22.07 | 100% |
+| 2025-11 | 11.17 | 11.17 | 100% |
+| 2026-07 | 1.76 | 21.33 | 34.3% |
+
+A clean month matches on 83% to 100% of rows and its mean is within a few percent. An
+affected month matches on 34% to 54% and its mean is 5 to 8 times too low.
+
+The split is clean rather than a judgement call. Of the 233 months holding at least
+1,000 stories, 20 have a mean `log1p(score)` below 1.10 and 213 are above 1.26. One
+month, `2023-12`, sits between them at 1.199 with 64% agreement, and is excluded with
+the rest.
+
+The affected months are **2022-12 through 2023-12** and **2026-01 through 2026-08**:
+569,815 stories, 12.0% of the ingest. Two separate windows, so this is a recurring
+upstream regression rather than one bad run.
+
+They are kept in `data/stories.parquet` and excluded at read time by
+`ingest.drop_unsettled_months`. Their titles, authors and timestamps are still true, and
+a later phase may want them for something that is not a label.
+
+### Why gate 3 could not use `committed_at`
+
+The brief's method for the settling gate reads a story's age at observation as
+`committed_at - time`. That needs the file's commit to be close in time to the month it
+covers, and it needs the scores in it to have been read at that commit. Neither holds.
+
+Of the 239 committed months, 231 were backfilled in a single pass on 2026-03-14, so
+their ages at observation run from 13 days to 19 years. Only 6 were committed at their
+own month boundary: 2026-03 through 2026-08. **Those are exactly the months whose scores
+were captured at submission.** The one property that makes a month usable for the gate
+travels with the one property that makes it useless.
+
+So gate 3 keeps the brief's method, a single observation instant across posts of many
+ages, and gets the instant from a live read of the HN API instead.
+
+## Embeddings
+
+### Terminology
+
+CBOW and Skip-gram are training **objectives**, not embeddings. You train a model on a
+fill-in-the-blank task, throw the task away, and keep the input weight matrix, one row
+per word. That matrix is the embedding. The phrase "CBOW embeddings" does not appear in
+this project's writing.
+
+Both objectives learn two matrices, centre and context. Convention keeps the first.
+Averaging the two is a cheap variant and is tested.
+
+- `cbow.py` predicts the centre word from the averaged context vectors
+- `skipgram.py` predicts context words from the centre word
+
+Skip-gram generates one training pair per context position instead of one per window, so
+it sees more updates per token, trains slower, and generally does better on rare words.
+
+### Negative sampling, and where each number comes from
+
+A full softmax over a 100k vocabulary is not viable, so both objectives use negative
+sampling. Hyperparameters follow Mikolov et al. 2013.
+
+| Setting | Value | Source |
+|---|---|---|
+| Negative samples `k`, text8 and HN titles | 15 | Paper recommends 5 to 20 for small corpora |
+| Negative samples `k`, Wikipedia subset | 5 | Paper recommends 2 to 5 for large corpora |
+| Noise distribution | Unigram counts raised to 0.75 | The paper's tuned value, best of the distributions tried |
+| Frequent-word subsampling | `t = 1e-5` | The paper's rule, `P(keep) = min(1, sqrt(t/f))` |
+| Context window | Dynamic, sampled from 1 to 5 | Weights nearer context words more heavily at no extra cost |
+
+The 0.75 power flattens the unigram distribution so rare words turn up as negatives more
+often than their raw frequency would allow. `k` is tunable and these are starting points.
+
+### Development and validation
+
+Development runs on `text8`, 100 MB, which trains in minutes and makes the
+implementation debuggable. Correctness is checked against gensim on the same corpus
+before anything scales up. Matching gensim within noise on text8 is the gate for moving
+to the Wikipedia subset.
+
+A from-scratch PyTorch SGNS runs one to two orders of magnitude slower than gensim's
+Cython. The subset size is chosen from a measured tokens-per-second figure, not a guess.
+
+Intrinsic evaluation uses the Google analogy set, WordSim-353, and nearest-neighbour
+spot checks on HN vocabulary (`rust`, `yc`, `llm`). Coverage is reported alongside
+accuracy, because a small vocabulary can post a flattering score on the few questions it
+can answer. Intrinsic scores are a sanity check. The result is the downstream task.
+
+### Three variants
+
+| Variant | Initialisation | Trained on |
+|---|---|---|
+| wiki-only | Random | Wikipedia subset |
+| hn-only | Random | HN titles |
+| fine-tuned | Wikipedia vectors | HN titles at a lower learning rate |
+
+Words appearing in HN but not in Wikipedia get random initialisation before fine-tuning.
+
+### Title vector
+
+Mean pooling by default. SIF (smooth inverse frequency weighting plus removal of the
+first principal component, Arora et al. 2017) is the upgrade. Both sit behind one
+interface in [`features/pooling.py`](../src/hn_upvotes/features/pooling.py), so the
+fusion models do not know which is active.
+
+SIF is fitted on training rows only. Fitting the word frequencies or the principal
+component on the full frame would leak test-period vocabulary statistics backwards.
+
+## Fusion architectures
+
+Four inputs: the pooled title vector, the author, the domain, and the temporal features.
+Author and domain are high cardinality, so they get learned embedding tables, with values
+below a minimum post count bucketed to a shared out-of-vocabulary row.
+
+| Architecture | Structure | Learns interactions | Notes |
+|---|---|---|---|
+| Early | Concatenate all four, one MLP to a scalar | Yes | A weak modality can drag the shared representation |
+| Late | One tower per modality to its own scalar, learned combination | No | Interpretable per modality, degrades gracefully when one is missing |
+| Hybrid | Encode each modality, concatenate the encodings, joint head | Yes | What production ranking systems usually do |
+
+Late fusion is the one that handles a text post cleanly: no URL means the domain tower
+drops out and the weights renormalise.
+
+Ablations drop each modality in turn, so the results can state what each one is worth
+rather than asserting it.
+
+## Evaluation
+
+Primary metrics are RMSE and MAE on the normalised target, because that is the space the
+model trains in. A normalised error is hard to read alone, so three more are reported:
+
+- **RMSE on `log1p(score)`**, after mapping predictions back through the test period's
+  trailing baseline. Quotable in real score terms.
+- **Spearman correlation on raw score.** Ranking quality is what a submission-time
+  predictor is for, and Spearman is invariant to the whole normalisation, so it is the
+  metric the target transform cannot flatter.
+- **Precision@100.** Of the top 100 posts the model predicts, how many really landed
+  high.
+
+Validation is walk-forward rather than a single early/late cut. Train on a window, test
+on the window immediately after, roll forward, repeat. Drift within each fold is small,
+and the sequence of scores shows whether the model degrades as it ages. A single split
+gives one number and hides that.
+
+Every number is quoted as mean plus or minus standard deviation across five seeds. A
+single run is not evidence. Where two models differ by less than the seed noise, they
+are reported as indistinguishable rather than ranked.
+
+### Baseline ladder
+
+Built before any neural network, so there is a real bar to clear. Every rung predicts in
+normalised target space, the same space the fusion models train in.
+
+1. Predict the trailing baseline, which in normalised space is just zero
+2. Author historical mean, time aware
+3. Domain historical mean, time aware
+4. TF-IDF plus Ridge
+5. TF-IDF plus gradient boosting
+
+Rung 5 sees the same four modalities as the fusion models, without learned
+representations, so it is the honest comparison. If no fusion model beats it, the README
+says so. An honest negative result reads better than a suspiciously good number.
+
+## References
+
+- Mikolov, Sutskever, Chen, Corrado, Dean (2013). *Distributed Representations of Words
+  and Phrases and their Compositionality.* NeurIPS.
+  [arXiv:1310.4546](https://arxiv.org/abs/1310.4546). Source of the negative sampling
+  count, the 0.75 noise power, and the `t = 1e-5` subsampling rule.
+- Mikolov, Chen, Corrado, Dean (2013). *Efficient Estimation of Word Representations in
+  Vector Space.* [arXiv:1301.3781](https://arxiv.org/abs/1301.3781). The CBOW and
+  Skip-gram objectives, and the analogy evaluation set.
+- Arora, Liang, Ma (2017). *A Simple but Tough-to-Beat Baseline for Sentence Embeddings.*
+  ICLR. [OpenReview](https://openreview.net/forum?id=SyK00v5xx). The SIF pooling used in
+  `features/pooling.py`.
+- Finkelstein et al. (2002). *Placing Search in Context: The Concept Revisited.* ACM TOIS.
+  The WordSim-353 similarity ratings.
