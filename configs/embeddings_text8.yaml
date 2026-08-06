@@ -1,0 +1,22 @@
+# Development corpus. text8 is 100 MB and trains in minutes, which makes the
+# from-scratch implementation debuggable. Correctness is checked against gensim on this
+# same corpus before anything scales up.
+#
+# k = 15 follows Mikolov et al. 2013, "Distributed Representations of Words and Phrases
+# and their Compositionality", which recommends 5 to 20 negative samples for small
+# corpora. The noise distribution is the unigram counts raised to 0.75, the paper's
+# tuned value. Subsampling uses the paper's t = 1e-5.
+
+corpus: text8
+objective: skipgram     # cbow | skipgram
+dimension: 300
+window: 5
+negative_samples: 15
+noise_power: 0.75
+subsample_threshold: 1.0e-5
+dynamic_window: true
+min_count: 5
+epochs: 5
+batch_size: 1024
+learning_rate: 2.5e-3
+seed: 0
