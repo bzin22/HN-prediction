@@ -57,6 +57,16 @@ Era drift is real. Scoring inflation is concentrated in the tail, and none of th
 statistics a trailing transform can use will show it: not the mean, not the median, not
 the standard deviation, not the interquartile range.
 
+![Median and mean log1p(score) per year](img/gate1-median-by-year.png)
+
+The median is the flat line. It takes one value for eighteen consecutive years, and 2023
+is missing because its archived scores are not final. The mean wanders between 1.43 and
+1.70 with no trend.
+
+![Standard deviation and IQR of log1p(score) per year](img/gate2-spread-by-year.png)
+
+The two spread measures cross and diverge. Neither is tracking a trend.
+
 Raw score by percentile, 2007 against 2025:
 
 | Percentile | 2007 | 2025 | Ratio |
@@ -158,6 +168,15 @@ not hold here. Measured over the 4,168,189 settled stories: 32.9% score exactly 
 monotone, so it cannot spread a point mass: the spike moves to 0.693 and 1.099 and stays
 exactly as tall. Treat any percentile conversion as indicative.
 
+![Raw and log1p score distributions](img/score-distribution.png)
+
+| Score | Stories | Share |
+|---|---|---|
+| 1 | 1,372,666 | 32.9% |
+| 2 | 1,027,583 | 24.7% |
+| 3 | 488,649 | 11.7% |
+| **1 or 2** | **2,400,249** | **57.6%** |
+
 That share also settles the secondary-readout question. Percentile rank is worth
 reporting, but it cannot be the target: with 57.6% of the mass on two values, more than
 half of all stories share one of two percentile ranks, and any ranking inside that block
@@ -191,7 +210,35 @@ The reference implementation of the window bound is
 [`compute_trailing_baseline`](../src/hn_upvotes/target/normalise.py). Every other
 rolling statistic in the project copies its bound.
 
-### How the lag was measured
+### What the lag came out as
+
+24 hours, down from the scaffold's assumed 48. 13,852 current scores were read from the
+live HN API in one pass at 2026-08-06 06:22 UTC. One reading instant across posts of
+many ages gives the curve directly.
+
+![Mean log1p(score) by age at observation, with confidence intervals](img/gate3-settling-bands.png)
+
+| Age at observation | Mean `log1p(score)` | 95% interval |
+|---|---|---|
+| 0-12 h | 1.490 | 1.377 to 1.603 |
+| 12-24 h | 1.733 | 1.662 to 1.816 |
+| 24-48 h | 1.656 | 1.597 to 1.719 |
+| 48-72 h | 1.534 | 1.467 to 1.603 |
+| 72-168 h | 1.782 | 1.732 to 1.829 |
+| 14 days and older | 1.683 | 1.656 to 1.712 |
+
+Only the 0-12 hour band sits below the settled reference with a clear gap. The 12-24 hour
+band already overlaps it. Later bands wander above and below by more than their intervals,
+which is day-to-day cohort variation rather than settling, so the answer is the top of the
+interval where settling completes.
+
+Each band is averaged over its UTC hour-of-day cells with equal weight, because with one
+reading instant a post's age and its submission hour are locked together. The raw
+unbalanced curve is [`gate3-settling-curve.png`](img/gate3-settling-curve.png); at this
+sample size the mean is noise and the median is pinned to the floor spike, which is why
+the band chart carries the conclusion.
+
+### The method, and why the archive's own timestamps could not supply it
 
 The dataset publishes `stats.csv`, one row per committed month, with a `committed_at`
 timestamp. That is the instant the month's file was fetched from the HN API, so **every
@@ -464,6 +511,51 @@ gives one number and hides that.
 Every number is quoted as mean plus or minus standard deviation across five seeds. A
 single run is not evidence. Where two models differ by less than the seed noise, they
 are reported as indistinguishable rather than ranked.
+
+### The reporting format
+
+**Nothing here has been measured.** These tables are the shape of the output, kept empty
+so the format is fixed before any number exists and cannot be chosen after the fact to
+flatter a result. They fill in from Phase 2 onward.
+
+| Model | RMSE (target) | MAE (target) | RMSE (`log1p` score) | Spearman | P@100 |
+|---|---|---|---|---|---|
+| 1. Trailing baseline | | | | | |
+| 2. Author mean | | | | | |
+| 3. Domain mean | | | | | |
+| 4. TF-IDF + Ridge | | | | | |
+| 5. TF-IDF + GBM | | | | | |
+| Early fusion | | | | | |
+| Late fusion | | | | | |
+| Hybrid fusion | | | | | |
+
+Embedding variants, downstream on the best fusion architecture:
+
+| Variant | Objective | RMSE (target) | Spearman | Analogy acc. | WordSim-353 ρ |
+|---|---|---|---|---|---|
+| wiki-only | CBOW | | | | |
+| wiki-only | Skip-gram | | | | |
+| hn-only | CBOW | | | | |
+| hn-only | Skip-gram | | | | |
+| fine-tuned | CBOW | | | | |
+| fine-tuned | Skip-gram | | | | |
+
+Ablations, dropping one modality at a time:
+
+| Dropped modality | RMSE (target) | Change vs full |
+|---|---|---|
+| None (full model) | | |
+| Title | | |
+| Author | | |
+| Domain | | |
+| Temporal | | |
+
+Implementation check against gensim on the same corpus:
+
+| Corpus | Metric | This implementation | gensim |
+|---|---|---|---|
+| text8 | Analogy accuracy | | |
+| text8 | WordSim-353 ρ | | |
 
 ### Baseline ladder
 
