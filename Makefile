@@ -35,6 +35,14 @@ check: lint test ## Everything CI runs
 ingest: ## Phase 1. Build the stories table from the Parquet dump
 	$(UV) run --extra data python -m hn_upvotes.data.ingest
 
+.PHONY: clean-shards
+clean-shards: ## Phase 1. Delete the monthly shards. Safe once ingest reports its count
+	rm -rf data/shards
+
+.PHONY: notebook
+notebook: ## Phase 1. Re-execute the EDA notebook in place, outputs and all
+	$(UV) run --extra data jupyter execute --inplace notebooks/01-eda.ipynb
+
 .PHONY: train-embeddings
 train-embeddings: ## Phase 3. Train one word2vec objective
 	$(UV) run --extra train python -m hn_upvotes.embeddings.train
