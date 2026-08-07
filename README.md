@@ -100,11 +100,55 @@ rung 3 on the 13.8% whose host has none. `make baselines` reproduces all of it i
 | 0 | Repo, README, scaffold, CI | Done |
 | 1 | Ingest and EDA, three gates, leak audit | Done |
 | 2 | Time split, six baseline rungs, the metrics that report them | Done |
-| 3 | CBOW and Skip-gram on text8, validated against gensim, then the Wikipedia subset | Not started |
+| 3 | CBOW and Skip-gram on text8, validated against gensim, then the Wikipedia subset | Implemented, not yet trained |
 | 4 | HN fine-tuning, three-variant comparison | Not started |
 | 5 | Early, late and hybrid fusion, plus ablations | Not started |
 | 6 | FastAPI and Docker | Not started |
 | 7 | Results write-up | Not started |
+
+## Phase 3: the implementation, before any training
+
+CBOW and Skip-gram are implemented from scratch and the overnight training chain is wired
+up. **Nothing has been trained on a real corpus yet**, by design: the algorithms get
+reviewed before an epoch is spent. Every number below is from a synthetic corpus or a
+microbenchmark. The reasoning is in [`docs/word2vec.md`](docs/word2vec.md).
+
+Two measurements decided the shape of it, both from `make throughput`.
+
+**Sparse gradients work on both CPU and MPS.** torch 2.13.0 at 100,000 words by 300
+dimensions produces a genuine sparse gradient, 19.7 MB of touched rows against 120 MB
+dense, and SGD steps on it.
+
+**Run it on CPU, not the GPU.** Training pairs per second, skip-gram at the full
+vocabulary:
+
+| Device | Sparse gradients | Dense gradients |
+|---|---|---|
+| **CPU** | **105,142** | 34,469 |
+| MPS | 24,383 | 38,335 |
+
+CPU is 4.3x faster than MPS, and the Python feeder is not the bottleneck either: it moves
+963,848 tokens/s against the 81,603 the fastest training configuration consumes. The cost
+is the embedding backward, and a step touching 16,000 rows of 300 floats is too little
+arithmetic to pay for MPS kernel launches. This is why gensim is CPU threads with no GPU.
+`select_device()` returns CPU as a result, against the scaffold's assumption.
+
+That throughput sizes the Wikipedia stage rather than a guess doing it. At `k = 5` and a
+two-hour ceiling over 5 epochs: `138,362 x 0.96 x 7,200 / 5 = 191,271,628` tokens, about
+1.13 GB.
+
+```bash
+make throughput      # the two measurements above
+make chain-dry-run   # all four overnight stages on synthetic corpora, about 7 seconds
+make chain           # the real overnight run, detached
+```
+
+The chain runs a gate first: train on text8, train gensim on the same corpus with the same
+settings, compare on the intrinsic evaluations, and **abort the whole night if our vectors
+are meaningfully worse**. Then the three variants the project compares, with `hn-only` last
+so a Wikipedia failure costs one variant instead of the night. It checkpoints every epoch,
+resumes from the newest checkpoint, holds a wall-clock budget per stage, and writes one
+JSON manifest so a night is readable from one file.
 
 ## Getting started
 
@@ -135,17 +179,29 @@ Code is `src/hn_upvotes/`, split into `data/`, `embeddings/`, `features/`, `targ
 [`data/splits.py`](src/hn_upvotes/data/splits.py),
 [`data/preprocess.py`](src/hn_upvotes/data/preprocess.py),
 [`data/gates.py`](src/hn_upvotes/data/gates.py),
-[`models/baselines.py`](src/hn_upvotes/models/baselines.py) and
-[`training/metrics.py`](src/hn_upvotes/training/metrics.py). Everything else is a stub
+[`models/baselines.py`](src/hn_upvotes/models/baselines.py),
+[`training/metrics.py`](src/hn_upvotes/training/metrics.py),
+[`embeddings/negative_sampling.py`](src/hn_upvotes/embeddings/negative_sampling.py),
+[`embeddings/cbow.py`](src/hn_upvotes/embeddings/cbow.py),
+[`embeddings/skipgram.py`](src/hn_upvotes/embeddings/skipgram.py),
+[`embeddings/train.py`](src/hn_upvotes/embeddings/train.py),
+[`embeddings/corpora.py`](src/hn_upvotes/embeddings/corpora.py),
+[`embeddings/checkpoint.py`](src/hn_upvotes/embeddings/checkpoint.py),
+[`embeddings/throughput.py`](src/hn_upvotes/embeddings/throughput.py) and
+[`embeddings/chain.py`](src/hn_upvotes/embeddings/chain.py). Everything else is a stub
 carrying its real type-annotated signature and a docstring saying what it will do.
 
 ## Hardware
 
-An Apple M2 with 24 GB of unified memory, PyTorch on the MPS backend. No CUDA, no cloud
-GPU. Full English Wikipedia is out of scope, so the embedding corpus is a subset whose
-size is set from a measured throughput number in Phase 3. MPS is not available inside a
-container, so local training runs outside Docker and the training image exists for
-reproducibility elsewhere.
+An Apple M2 with 24 GB of unified memory. No CUDA, no cloud GPU. Full English Wikipedia is
+out of scope, so the embedding corpus is a subset sized from a measured throughput number,
+which came out at about 191M tokens for a two-hour ceiling.
+
+**Word2vec training runs on the CPU, not the MPS backend.** Phase 3 measured CPU at 4.3x
+MPS for this workload, because the steps are too small to pay for GPU kernel launches. MPS
+is not available inside a container either, so local training runs outside Docker and the
+training image exists for reproducibility elsewhere. A larger model in a later phase may
+well favour MPS; that is a separate measurement.
 
 ## Licence
 

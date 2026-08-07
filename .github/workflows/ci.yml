@@ -37,3 +37,25 @@ jobs:
 
       - name: Test
         run: pytest -v
+
+  # The word2vec tests need torch and gensim, which the base install deliberately does not
+  # carry. They skip entirely under `check`, so without this job they would never run in CI.
+  # Split into its own job so the fast checks are not held up behind a torch download.
+  embeddings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      # The CPU wheel, because there is no GPU on a runner and the CUDA build is 2 GB.
+      - name: Install with the train extra
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev,train]"
+
+      - name: Test the embeddings
+        run: pytest -v tests/test_embeddings_sgns.py tests/test_embeddings_chain.py
