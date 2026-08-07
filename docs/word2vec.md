@@ -4,8 +4,10 @@ Why the code is shaped the way it is. [`design.md`](design.md) holds the project
 reasoning and the embedding hyperparameter table; this note covers the implementation itself
 and the two measurements that could have invalidated it.
 
-Nothing here has been trained on a real corpus yet. Every number below comes from a synthetic
-corpus or a microbenchmark, and each says which.
+**text8 has now been trained on, for two hyperparameter measurements and nothing else.** The
+learning-rate sweep and the batch-scaling check are 5M and 120k tokens of it. Wikipedia and
+Hacker News have not been trained on, and no variant has been produced. Every other number
+below comes from a synthetic corpus or a microbenchmark, and each says which.
 
 ## Contents
 
@@ -14,13 +16,16 @@ corpus or a microbenchmark, and each says which.
 - [Why negative sampling](#why-negative-sampling)
 - [The two objectives differ by one line](#the-two-objectives-differ-by-one-line)
 - [Why plain SGD](#why-plain-sgd)
+- [Settling the learning rate on text8](#settling-the-learning-rate-on-text8)
 - [The learning rate is per example, and the batch scales it](#the-learning-rate-is-per-example-and-the-batch-scales-it)
 - [Subsampling, and two ways gensim differs](#subsampling-and-two-ways-gensim-differs)
 - [Risk 1: sparse gradients](#risk-1-sparse-gradients)
 - [Risk 2: the GPU or the Python](#risk-2-the-gpu-or-the-python)
 - [What the measurements changed](#what-the-measurements-changed)
 - [The overnight chain](#the-overnight-chain)
+- [Both objectives, six variants](#both-objectives-six-variants)
 - [Sizing the Wikipedia stage](#sizing-the-wikipedia-stage)
+- [What a night costs](#what-a-night-costs)
 - [The gate](#the-gate)
 - [What is not proved yet](#what-is-not-proved-yet)
 
@@ -133,9 +138,117 @@ objective or the optimiser did it. Note for whoever runs it, Adagrad's accumulat
 only grows, so its rate decays monotonically and can stall on a long run. It may win on text8
 and lose on Wikipedia.
 
+## Settling the learning rate on text8
+
+The rate was moved from the scaffold's 0.0025 to gensim's 0.025 on the strength of an
+argument. `make lr-sweep` measures it instead.
+
+Four rates over an identical 5,000,000-token slice of text8, **three seeds each**, one epoch,
+dimension 300, `k = 15`, batch 1024. One vocabulary of 36,281 word types built once and shared,
+so the corpus, the vocabulary and the point at which the schedule reaches `min_learning_rate`
+are the same in all twelve runs and the only difference is the rate.
+
+| Rate | Blew up | Final loss | Worst lurch | As a share of the fall | WordSim-353 | Analogy |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.0025 | 0 of 3 | 5.5199 | 0.171 | 3.1% | -0.015 | 0.00003 |
+| 0.01 | 0 of 3 | 3.9568 | 0.215 | 3.0% | 0.031 | 0.00000 |
+| **0.025** | **0 of 3** | **3.8915** | 0.408 | 5.8% | **0.079** | **0.00028** |
+| 0.05 | **2 of 3** | 4.1501 | 1.498 | 24.9% | 0.089 | 0.00064 |
+
+The loss columns for 0.05 are its **one surviving seed**, because averaging a 2.5e16 into a
+mean produces a number that is not about anything. The two intrinsic scores are over all three
+seeds, since a blown-up run still leaves a matrix and dropping its score would flatter the
+rate.
+
+**The answer is 0.025, and it is unchanged.** The argument for it happened to be right; the
+measurement is now the reason for it.
+
+### The curves
+
+The loss is recorded every 50 batches, so a run is 153 points. Seed 0, sampled at 0%, 10%,
+20%, 30%, 40%, 60%, 80% and 100% through the epoch:
+
+| Rate | Loss curve, seed 0 |
+|---|---|
+| 0.0025 | 11.09 → 11.00 → 9.18 → 7.78 → 6.92 → 6.02 → 5.69 → **5.54** |
+| 0.01 | 11.09 → 6.01 → 4.70 → 4.31 → 4.14 → 3.95 → 3.95 → **4.00** |
+| 0.025 | 10.87 → 4.72 → 4.10 → 4.00 → 3.88 → 3.74 → 3.80 → **3.93** |
+| 0.05 | 10.16 → 5.20 → 4.96 → 4.71 → 4.45 → 4.08 → 3.97 → **4.15** |
+
+Every curve starts near 11.09, which is the `(1 + k) * log 2` a zero output matrix forces
+before any step. 0.0025 has still not reached 9 by the time the others are under 5.
+
+The 0.05 row is the one seed that survived, and it is smoothed by this sampling. At full
+resolution its first fifth reads 10.16, 5.44, **6.29**, 5.05, **5.47**, 4.45: it goes back up
+by more than a full nat twice. Its two other seeds do not recover:
+
+| Rate 0.05 | Loss curve |
+|---|---|
+| seed 0 | 10.16 → 5.20 → 4.96 → 4.71 → 4.45 → 4.08 → 3.97 → **4.15** |
+| seed 1 | 10.22 → 7.2e6 → 5.1e12 → 4.8e12 → 2.6e12 → 8.6e11 → 3.4e11 → **1.2e11** |
+| seed 2 | 10.18 → 1.6e9 → 4.0e17 → 5.2e17 → 3.2e17 → 8.0e16 → 3.4e16 → **2.5e16** |
+
+Both are gone inside the first tenth of the epoch. The decay to `min_learning_rate` then pulls
+the loss back down by orders of magnitude over the rest of the run, which is why the final
+number is smaller than the peak and why "did the loss fall" is not on its own a test.
+
+Both ends behaved as predicted, one of them more dramatically than expected.
+
+**0.0025 crawls.** It descends perfectly smoothly and gets nowhere: after all 5M tokens it is
+at 5.52, a loss the other rates pass inside the first 5% of their run. Its vectors score
+-0.015 on WordSim-353, which is nothing, on all three seeds.
+
+**0.05 diverges.** Not lurches, diverges: seed 1 ended at 1.2e11 and seed 2 at 2.5e16, against
+a starting loss of 11.09. Seed 0 was the survivor, and even it lurched by 1.50 in one block,
+24.9% of its total fall against 5.8% for 0.025.
+
+### The seeds are the point
+
+A single-seed sweep drew seed 0 first, and on seed 0 rate 0.05 does not blow up. It posts the
+best WordSim-353 score of the four and the best analogy accuracy, and the whole thing turns on
+reading a lurch in a loss curve. **Three seeds turned a judgement call into a result.**
+
+The intrinsic scores needed the seeds even more than the loss did. On one seed the four rates
+scored -0.018, 0.091, 0.058 and 0.149, which reads as a clean ranking putting 0.01 above
+0.025. Over three seeds, 0.01 scores 0.091, -0.023 and 0.023. Its apparent lead was one draw.
+
+So every comparison is checked against a noise band before it decides anything, and the band
+is the larger of two numbers. The sampling error on a Spearman correlation over `n` pairs is
+about `1 / sqrt(n - 3)`, and WordSim-353 covers 336 of its 353 pairs at this vocabulary, so
+that is **0.055**. The other is the measured spread across the seeds, which for 0.01 is 0.114,
+more than twice the formula's estimate. Without that check the rule throws 0.025 out for being
+"36% short" of a number that was noise.
+
+Analogy accuracy is the one that discriminates cleanly despite being tiny. It counts correct
+answers out of 13,095 in-vocabulary questions, so 0.00028 against 0.00000 is 3.7 correct
+against 0, and a difference in counts that small is still a real difference in a way a
+correlation coefficient is not. It agrees with WordSim-353 and with the loss: 0.025 is the best
+of the stable rates on all three.
+
+### What the rule is
+
+Two tests on the rate alone, then one comparison, then take the largest survivor. A larger
+rate that converges gets further in the same wall clock, and this project's ceiling is wall
+clock.
+
+1. **It converged.** No seed blew up, and the mean loss fell by at least 5% of the 11.09 that
+   a zero output matrix forces at the start. 0.05 fails the first; 0.0025 clears both, barely.
+2. **It converged smoothly.** No single block of 50 batches rose by more than 10% of the total
+   fall. The stable rates sit at 3.0% to 5.8% and the surviving 0.05 seed at 24.9%, so the
+   threshold is 1.7x clear of one end and 2.5x clear of the other. It was 0.25 on the first
+   pass, chosen blind, and 0.05 cleared it by 0.0009.
+3. **Its vectors are not meaningfully worse than the best stable rate's**, where "meaningfully"
+   means both over 20% and wider than the noise band. 0.0025 fails this: a gap of 0.094
+   against a band of 0.055.
+
+The bar in the third test is set by the best **stable** rate, not the best rate overall. 0.05
+scored the highest WordSim-353 of the four and was already out; letting it set the bar would
+have disqualified every rate that did not diverge.
+
 ## The learning rate is per example, and the batch scales it
 
-This is the one piece of arithmetic in the harness that looks wrong and is not.
+This is the one piece of arithmetic in the harness that looks wrong and is not. **It was
+argued first and has now been measured**, with `make batch-scaling`.
 
 `forward` returns the **mean** loss over the batch. gensim updates one example at a time. So a
 word appearing once in a batch of 1024 moves by `rate / 1024` times its gradient, where
@@ -149,18 +262,52 @@ default of 0.025, and the optimiser is given `learning_rate * batch_size`:
 0.025 * 1024 = 25.6
 ```
 
-The number looks alarming and is not. The quantity reaching a single row of the matrix is
-still 0.025 times a gradient. This is the linear scaling rule, and
-[`optimiser_learning_rate`](../src/hn_upvotes/embeddings/train.py) is the one place it happens.
+### Measured, on 120,000 tokens of text8
+
+Four arms, one corpus, one seed, **83,331 training examples per epoch identical for every
+arm** and two epochs, so the arms differ by batch size and nothing else. Dimension 64,
+`k = 15`, per-example rate 0.025 throughout. The fourth arm is the control: the same batch of
+1024 with `optimiser_learning_rate` replaced by the identity, which is what the code would do
+if the multiplication were deleted.
+
+| Arm | Optimiser rate | Epoch losses | Steps | Against batch 1 | Neighbour overlap |
+|---|---:|---|---:|---:|---:|
+| batch 1 | 0.025 | 7.8857, **4.8183** | 166,662 | | |
+| batch 32 | 0.8 | 8.7407, **4.9987** | 5,210 | +3.7% | 0.501 |
+| batch 1024 | 25.6 | 9.3678, **5.4211** | 164 | +12.5% | 0.108 |
+| batch 1024, unscaled | 0.025 | 11.0790, **11.0790** | 164 | +129.9% | 0.132 |
+
+**The multiplication is right, and it is the difference between learning and not learning.**
+Without it, the same batch does not move at all: 11.0790 is the `(1 + k) * log 2 = 11.0904`
+that a zero output matrix forces before a single step. With it, the loss more than halves.
+And at 25.6 nothing diverges, which was the other way the claim could have failed.
+
+The test is deliberately a ratio and not a tolerance. The scaled arm's residual gap of 0.603
+is **10.4x smaller** than the control's 6.261, and no threshold anywhere in that range turns
+the answer around. The first pass at this did put a 10% tolerance on the batch-1 gap, blind,
+and then measured 12.5%, which is a threshold deciding the answer rather than reporting it.
+
+### The residual is real and now has a size
+
+The scaling is right in kind and it is not exact. The gap against batch 1 is **+3.7% at batch
+32 and +12.5% at batch 1024**, growing with the batch, which is the shape one effect predicts:
+updates inside a batch do not see each other, where a batch-1 run's do. No learning rate can
+undo that. It is a cost of batching, so it is reported and not gated.
+
+Two consequences worth carrying forward. Part of whatever gap the gate sees against gensim is
+this, not a bug, because gensim updates sequentially. And **batch 1024 is still the right
+default**: batch 32 gives up 8.8 points of that gap but takes 6 seconds against 2 for the same
+83,331 examples, and this project's ceiling is wall clock.
+
+The neighbour overlap column says the same thing less kindly. Two runs that reach a similar
+loss do not reach the same matrix: batch 32 agrees with batch 1 on half of each frequent
+word's ten nearest neighbours and batch 1024 on a tenth. At 120,000 tokens both matrices are
+undertrained, so this is a caveat on reading loss as identity rather than a measurement of
+either.
 
 **The scaffold's default was 2.5e-3, ten times lower and on the scale of an Adam rate rather
-than an SGD one.** It is now 0.025, decaying linearly to 0.0001, both of which are gensim's
-defaults. That is a change from what the scaffold shipped and it is deliberate: the decision
-recorded for this phase was to mirror gensim.
-
-What batching genuinely does change is that updates inside one batch do not see each other,
-where gensim's sequential ones do. That is inherent to batching and is a reason to expect a
-small gap against gensim, not a reason to leave the step size wrong.
+than an SGD one.** It is 0.025 now, and [the sweep](#settling-the-learning-rate-on-text8) is
+why rather than the argument for mirroring gensim.
 
 ## Subsampling, and two ways gensim differs
 
@@ -264,8 +411,8 @@ The other change is the learning rate, [above](#the-learning-rate-is-per-example
 
 ## The overnight chain
 
-[`chain.py`](../src/hn_upvotes/embeddings/chain.py) runs four stages in one process, in order.
-`make chain-dry-run` walks all four on synthetic corpora in about 7 seconds.
+[`chain.py`](../src/hn_upvotes/embeddings/chain.py) runs two objectives in one process, four
+stages each, in order. `make chain-dry-run` walks all eight on synthetic corpora in about 20 seconds.
 
 | Stage | Produces | Depends on |
 |---|---|---|
@@ -279,6 +426,65 @@ failure costs one variant rather than the night. Stage 2 loads stage 1's vectors
 on over HN titles and bodies at a tenth of the learning rate, so it adjusts Wikipedia's
 structure rather than overwriting it with a much smaller corpus. Words HN has and Wikipedia
 does not start random.
+
+## Both objectives, six variants
+
+The CBOW against Skip-gram comparison is the project's stated experiment, so the chain runs
+both and `ChainConfig.objectives` defaults to both. One invocation, Skip-gram then CBOW, four
+stages each, **six variants**.
+
+Three things had to hold, and each is a test.
+
+**Names.** Every artefact is `{objective}-{stage}.npz` and every checkpoint is
+`{objective}-{stage}-epoch{n}.npz`. The objective is in the file name and not only in the
+manifest, because a variant gets loaded by name later and a `wiki-only.npz` that could be
+either objective is a variant nobody can use in the comparison. The manifest carries
+`objective` and `stage` as separate fields on every record, so it groups either way without
+parsing a name back apart.
+
+**Isolation, at two levels.** A CBOW gate that aborts costs the three CBOW variants and
+nothing else; Skip-gram's three are already on disk and nothing rolls them back. The reverse
+holds too, and is its own test, because the objective that happens to run first is not
+special. Inside an objective, the per-stage isolation is unchanged.
+
+**Resume.** `newest_checkpoint` matches on the qualified stage name, so a finished Skip-gram
+Wikipedia stage cannot be picked up as a starting point for CBOW's. A resume after a complete
+run reports `already_complete` for all six variants and trains nothing.
+
+Two things are deliberately shared, and sharing them is what makes the comparison a
+comparison:
+
+* **The same Wikipedia subset, sized from Skip-gram's throughput.** Skip-gram is the slower
+  objective, so the subset fits its two-hour ceiling and CBOW finishes the same corpus early.
+  Sizing each objective to fill its own two hours would hand CBOW 2.2x the corpus and the
+  comparison would be measuring corpus size.
+* **Everything in `SGNSConfig` except the objective**, including the seed. A test asserts the
+  two stage configs are equal once the objective field is blanked.
+
+Fine-tuning warm-starts from **its own** objective's Wikipedia vectors, which is why the
+Wikipedia outcome is passed into stage 2 rather than looked up by stage name.
+
+### Running both immediately found something
+
+The dry-run corpus was sized when only Skip-gram ran, and CBOW failed its gate on it the
+first time: topic purity **0.392 against gensim's 1.000**, a 60.8% shortfall.
+
+Not a bug in CBOW. With a window of 5, Skip-gram produces up to ten training examples per
+position and CBOW exactly one, so on the same corpus CBOW takes **3.8x fewer optimiser steps**:
+25,134 against 95,347 per epoch on that corpus. It was undertrained, and raising the epochs to
+10 took it to 1.000. Batch size changes nothing here, which is itself a check on the batch
+scaling below: at batch 512, 256 and 128 CBOW finished at the same 3.747 to three decimals,
+because the per-example rate holds the trajectory fixed in examples rather than in steps.
+
+The fix is the corpus, not the objective. `DRY_RUN_CORPUS` is now 10 topics of 15 words over
+40,000 tokens, the cheapest shape measured where both objectives reach 1.000 against gensim's
+1.000 in 3 epochs. Chance is 1/10 and a deliberately broken matrix scores 0.104, so the gate
+keeps its margin.
+
+**The general point survives the dry run: CBOW converges later in corpus terms than Skip-gram
+does.** On text8 at 5 epochs it gets 27,000 optimiser steps against Skip-gram's 101,000, which
+is enough, but any future corpus sized on Skip-gram's numbers has to be checked against CBOW
+before it is trusted.
 
 Unattended operation needs six things beyond training, and each is tested:
 
@@ -322,12 +528,71 @@ One derived estimate did not survive measurement. `k = 5` costs 6 dot products p
 `k = 15`'s 16, which predicts 2.7x the throughput. **Measured, it is 1.80x**: 138,362 against
 77,019 tokens/s. The difference is fixed per-batch overhead that does not scale with `k`.
 
+## What a night costs
+
+Two objectives is not two nights. **7.5 hours expected, 11.0 hours of ceilings**, so it fits
+a night with room, and no stage is expected to hit its own ceiling.
+
+The HN corpus is counted rather than guessed: `make hn-token-count` reports **75,283,676
+tokens over 5,091,739 lines**, 14.8 tokens a line. The bodies are half of it. 4,739,207 titles
+at about 8 tokens is 38M, so the 352,532 lines of body text carry the rest on 7% of the rows.
+
+`overnight_budget` in [`chain.py`](../src/hn_upvotes/embeddings/chain.py) is the arithmetic,
+at 5 epochs, with the ceiling shown next to it:
+
+| Objective | Stage | Corpus tokens | Expected | Ceiling |
+|---|---|---:|---:|---:|
+| Skip-gram | gate | 17,005,207 | 19.2 min | 30 min |
+| Skip-gram | wiki-only | 191,271,628 | 120.0 min | 120 min |
+| Skip-gram | fine-tuned | 75,283,676 | 84.8 min | 90 min |
+| Skip-gram | hn-only | 75,283,676 | 84.8 min | 90 min |
+| CBOW | gate | 17,005,207 | 8.6 min | 30 min |
+| CBOW | wiki-only | 191,271,628 | 54.0 min | 120 min |
+| CBOW | fine-tuned | 75,283,676 | 38.2 min | 90 min |
+| CBOW | hn-only | 75,283,676 | 38.2 min | 90 min |
+| | **total** | | **7.46 h** | **11.0 h** |
+
+CBOW is the cheap half at 2.3 hours against Skip-gram's 5.2, because it is 2.224x faster per
+corpus token (181,487 against 81,603 measured at dimension 300, `k = 15`). Skip-gram's
+Wikipedia stage lands exactly on its two hours because that is the number the subset was sized
+from, and CBOW then reads the same subset in 54 minutes.
+
+Worked, for the Skip-gram Wikipedia stage: `191,271,628 tokens x 5 epochs / (138,362 x 0.96
+tokens/s) = 7,199 s`. For CBOW, the same corpus at 2.224x the rate: `7,199 / 2.224 = 3,237 s`.
+
+**Three costs are outside that table and one of them could matter.**
+
+1. **gensim's half of each gate.** The gate trains gensim on text8 as well as us, and only our
+   side is under the budget. Unmeasured on text8. The one measurement in hand is from the dry
+   run's synthetic corpus, where gensim managed 102,198 tokens/s against our 96,474, and its
+   Cython should do better on text8 than that. At 100,000 tokens/s it is 14 minutes per
+   objective, 28 for both.
+2. **The vocabulary pass.** Every stage counts its corpus once before training, and the
+   training loop then rereads it once per epoch. For the four HN stages that is a duckdb read
+   plus HTML stripping plus tokenisation, six times each, and the 77,019 tokens/s figure was
+   measured on an in-memory synthetic corpus rather than on that reader. **This is the number
+   most likely to be wrong**, and it is wrong in the direction of the night taking longer.
+3. **The Wikipedia download.** 1.13 GB over `hf://`, once, before Skip-gram's stage 1. CBOW
+   reuses the file.
+
+If the total does not fit, **the thing to cut is epochs on the HN stages, not an objective**.
+Dropping the four HN stages from 5 epochs to 3 saves 98 minutes and keeps all six variants,
+where dropping CBOW saves 2.3 hours and cancels the experiment the phase exists to run. The
+second lever is the Wikipedia ceiling: it is a ceiling and the subset is sized from it, so
+`--wikipedia-hours 1.5` shrinks the corpus and saves 45 minutes across both objectives.
+
 ## The gate
 
 Stage 0 trains our implementation and gensim on the same corpus with the same settings and
-compares them. A failure aborts the whole chain. That is the single most valuable thing in the
-design: without it a bug costs a night and shows up in the morning, and with it the chain
+compares them. A failure aborts **that objective**. That is the single most valuable thing in
+the design: without it a bug costs a night and shows up in the morning, and with it the chain
 stops in minutes and the machine sits idle instead, which is far cheaper.
+
+**It runs once per objective**, because it is validating that objective's implementation.
+CBOW and Skip-gram differ by one line of `forward`, and that one line is the masked average,
+which is the sharpest edge in the whole implementation. A Skip-gram gate says nothing about
+it. gensim's `sg` flag is set from the objective under test, so each is compared against its
+own reference rather than against Skip-gram's.
 
 It **fails closed**. A gate that could not run has not passed.
 
@@ -365,16 +630,25 @@ not a claim about text8, where its Cython should pull ahead.
 
 Stated plainly, because the rest of this note is measured and these are not.
 
-- **No real corpus has been trained on.** No text8, no Wikipedia, no HN. Every number here is
-  from a synthetic corpus or a microbenchmark. That is the brief: the algorithms get reviewed
-  before an epoch is spent.
+- **No variant has been produced.** Wikipedia and Hacker News have not been trained on, and
+  none of the six artefacts exists. text8 has been trained on only for the two hyperparameter
+  measurements, at 5M and 120k tokens, never a full run and never through the chain.
+- **The gate has never run on text8.** Both objectives pass it on the synthetic dry-run
+  corpus, which is not the same claim.
 - **The Wikipedia acquisition path has never run.** `prepare_wikipedia_subset` reads the
   Hugging Face dump with duckdb over `hf://`, the same way `data/ingest.py` reads the HN dump,
-  but exercising it means downloading a corpus. If the query or the dataset path is wrong,
-  stage 1 fails there first, and that failure is contained: stage 3 still produces `hn-only`.
-- **`download_text8` has never run**, for the same reason.
+  but exercising it means downloading 1.13 GB. If the query or the dataset path is wrong,
+  stage 1 fails there first, and that failure is contained: stage 3 still produces `hn-only`,
+  and the other objective is untouched.
 - **The gate thresholds are calibrated on synthetic corpora**, where a correct implementation
   agrees with gensim far more closely than it will on text8. Re-derive them at the first real
   gate run, and expect them to loosen.
-- **The HN corpus reader has not been run over the full 365 MB table.** It is exercised in the
-  dry run only through a synthetic stand-in.
+- **The intrinsic scores in the sweep are floor-level and are used only to rank.** WordSim-353
+  at 0.079 and analogy accuracy at 0.00028 are what 5M tokens and one epoch buy; the paper
+  trains on 20x that. They separate the rates and they are not a claim about the vectors.
+- **`gensim`'s half of the gate has not been timed on text8**, so the overnight budget has an
+  unmeasured 28 minutes in it. So does the Hacker News reader's throughput, which is the
+  larger of the two unknowns: the 77,019 tokens/s the budget uses was measured on an
+  in-memory synthetic corpus, not on duckdb plus HTML stripping plus tokenisation.
+- **`CBOW_SPEEDUP` was measured at `k = 15`, not at the `k = 5` the Wikipedia stage uses.** It
+  is used only to estimate how long CBOW's stages take, never to size a corpus.

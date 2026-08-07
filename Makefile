@@ -71,16 +71,30 @@ train-embeddings: ## Phase 3. Train one word2vec objective over one corpus
 throughput: ## Phase 3. Measure sparse gradients and tokens/s on CPU against MPS
 	$(BIN)/python -m hn_upvotes.embeddings.throughput
 
+# Both download text8 into data/corpora on first use, about 31 MB zipped.
+.PHONY: lr-sweep
+lr-sweep: ## Phase 3. Sweep the learning rate on text8 and pick one, about 25 minutes
+	$(BIN)/python -m hn_upvotes.embeddings.learning_rate_sweep
+
+.PHONY: batch-scaling
+batch-scaling: ## Phase 3. Check the batch-size rate multiplication against batch 1, minutes
+	$(BIN)/python -m hn_upvotes.embeddings.batch_scaling
+
+.PHONY: hn-token-count
+hn-token-count: ## Phase 3. Count the Hacker News corpus, which the overnight budget needs
+	$(BIN)/python -m hn_upvotes.embeddings.corpora
+
 .PHONY: chain-dry-run
-chain-dry-run: ## Phase 3. Walk all four overnight stages on synthetic corpora, seconds
+chain-dry-run: ## Phase 3. Walk every stage of both objectives on synthetic corpora, seconds
 	$(BIN)/python -m hn_upvotes.embeddings.chain --dry-run \
 		--output-directory artifacts/embeddings-dry-run
 
-# The real overnight run. Detached, so it survives the terminal closing, and it writes
-# artifacts/embeddings/run-manifest.json as it goes. Reads that file in the morning, not the
-# log. Add --resume to carry on from the newest checkpoint of each stage.
+# The real overnight run. Both objectives, four stages each, six variants. Detached, so it
+# survives the terminal closing, and it writes artifacts/embeddings/run-manifest.json as it
+# goes. Read that file in the morning, not the log. Add --resume to carry on from the newest
+# checkpoint of each stage, which does not restart an objective that already finished.
 .PHONY: chain
-chain: ## Phase 3. Launch the four-stage overnight chain, detached
+chain: ## Phase 3. Launch the overnight chain for both objectives, detached
 	$(BIN)/python -m hn_upvotes.embeddings.chain --detach
 
 .PHONY: serve
