@@ -124,6 +124,82 @@ All four are encoded in `data/ingest.py`; the evidence is in `docs/design.md`.
    silently moves rows across month boundaries: it moved 226 rows out of the Phase 2
    training segment before the counts were checked against the known totals.
 
+## Word2vec: three things measured in Phase 3 that override earlier assumptions
+
+`docs/word2vec.md` is the full reasoning. These three are the ones that change what you write.
+
+1. **Train on CPU, not MPS.** Measured 105,142 against 24,383 pairs/s at 100k words by 300
+   dimensions, so CPU is 4.3x faster. `select_device()` returns CPU on purpose, against the
+   scaffold's original assumption. Sparse gradients do work on MPS; MPS is just slower,
+   because the steps are too small to pay for kernel launches. The Python feeder is not the
+   bottleneck either (963,848 tokens/s). Re-measure before assuming this holds for a bigger
+   model in a later phase.
+2. **`SGNSConfig.learning_rate` is per example, and the optimiser gets it times the batch
+   size.** The loss is a batch mean, so `0.025 * 1024 = 25.6` reaches the optimiser. The
+   number looks wrong and is not; see `optimiser_learning_rate`. The scaffold's 2.5e-3 was an
+   Adam-scale rate and was replaced with gensim's 0.025 falling to 0.0001.
+3. **The gensim comparison has two divergences, not one.** Its `sample` default is 1e-3
+   against our 1e-5 and must be passed explicitly, and its subsampling formula is
+   `sqrt(t/f) + t/f` where the paper's is `sqrt(t/f)`, which cannot be passed away. Both are
+   in `evaluate.train_gensim`.
+
+Two gate metrics were tried and rejected; do not reinvent them. Rank correlation between our
+word-pair similarities and gensim's scores 0.012 for a *correct* implementation, because most
+random pairs have no defined answer. And the planted-synonym corpus cannot gate anything:
+gensim recovers 0 of 6 pairs on it while this implementation recovers 6, so it is too small to
+compare against. Gate on task scores instead, task supplied by the caller.
+
+`embeddings/negative_sampling.py` owns both matrices, the sampler and the loss; `cbow.py` and
+`skipgram.py` must contain nothing but `forward`. A test enforces that, because a duplicated
+sampler is how the CBOW-against-Skip-gram comparison stops meaning anything.
+
+The overnight chain is `embeddings/chain.py`, four stages, `make chain-dry-run` proves all four
+on synthetic corpora in about 7 seconds. Checkpoints carry **both** matrices, since resuming
+from the embedding alone restarts scoring from zero. A cut-short epoch banks under the previous
+epoch number and keeps its loss out of the per-epoch list, or a resume double-counts it.
+
+Embedding tests need the `train` extra, which the base install and the main CI job do not
+carry, so they `importorskip`. The separate `embeddings` CI job installs the CPU torch wheel and
+runs them; without that job they would never run anywhere.
+
+## Word2vec: three things measured in Phase 3 that override earlier assumptions
+
+`docs/word2vec.md` is the full reasoning. These three are the ones that change what you write.
+
+1. **Train on CPU, not MPS.** Measured 105,142 against 24,383 pairs/s at 100k words by 300
+   dimensions, so CPU is 4.3x faster. `select_device()` returns CPU on purpose, against the
+   scaffold's original assumption. Sparse gradients do work on MPS; MPS is just slower,
+   because the steps are too small to pay for kernel launches. The Python feeder is not the
+   bottleneck either (963,848 tokens/s). Re-measure before assuming this holds for a bigger
+   model in a later phase.
+2. **`SGNSConfig.learning_rate` is per example, and the optimiser gets it times the batch
+   size.** The loss is a batch mean, so `0.025 * 1024 = 25.6` reaches the optimiser. The
+   number looks wrong and is not; see `optimiser_learning_rate`. The scaffold's 2.5e-3 was an
+   Adam-scale rate and was replaced with gensim's 0.025 falling to 0.0001.
+3. **The gensim comparison has two divergences, not one.** Its `sample` default is 1e-3
+   against our 1e-5 and must be passed explicitly, and its subsampling formula is
+   `sqrt(t/f) + t/f` where the paper's is `sqrt(t/f)`, which cannot be passed away. Both are
+   in `evaluate.train_gensim`.
+
+Two gate metrics were tried and rejected; do not reinvent them. Rank correlation between our
+word-pair similarities and gensim's scores 0.012 for a *correct* implementation, because most
+random pairs have no defined answer. And the planted-synonym corpus cannot gate anything:
+gensim recovers 0 of 6 pairs on it while this implementation recovers 6, so it is too small to
+compare against. Gate on task scores instead, task supplied by the caller.
+
+`embeddings/negative_sampling.py` owns both matrices, the sampler and the loss; `cbow.py` and
+`skipgram.py` must contain nothing but `forward`. A test enforces that, because a duplicated
+sampler is how the CBOW-against-Skip-gram comparison stops meaning anything.
+
+The overnight chain is `embeddings/chain.py`, four stages, `make chain-dry-run` proves all four
+on synthetic corpora in about 7 seconds. Checkpoints carry **both** matrices, since resuming
+from the embedding alone restarts scoring from zero. A cut-short epoch banks under the previous
+epoch number and keeps its loss out of the per-epoch list, or a resume double-counts it.
+
+Embedding tests need the `train` extra, which the base install and the main CI job do not
+carry, so they `importorskip`. The separate `embeddings` CI job installs the CPU torch wheel and
+runs them; without that job they would never run anywhere.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

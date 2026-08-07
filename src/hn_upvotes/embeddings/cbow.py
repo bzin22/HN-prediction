@@ -8,26 +8,51 @@ matrix is the embedding.
 Two matrices are learned, centre and context. Convention keeps the input (centre) one.
 Averaging the two is a cheap variant and ``input_embeddings`` takes a flag for it.
 
+Everything except the forward pass lives in
+:mod:`hn_upvotes.embeddings.negative_sampling`, which this shares with Skip-gram. The one
+thing that is only CBOW's is :func:`masked_average`.
+
 Needs the ``train`` extra.
 """
 
 from __future__ import annotations
 
-import torch
-from torch import Tensor, nn
+from torch import Tensor
+
+from hn_upvotes.embeddings.negative_sampling import NegativeSamplingObjective
 
 
-class CBOWObjective(nn.Module):
+def masked_average(vectors: Tensor, mask: Tensor) -> Tensor:
+    """Average (batch, positions, dimension) over the positions the mask marks as real.
+
+    The dynamic window makes contexts ragged, so the padded positions have to be excluded
+    rather than averaged in. Padding uses word id 0, which is the unknown token and a real
+    row of the matrix, so getting this wrong would not crash: it would quietly average the
+    unknown vector into every short context and divide by the wrong count.
+
+    Worked example. A context of 2 real words out of a padded width of 10, with vectors
+    ``a`` and ``b``: this returns ``(a + b) / 2``. Averaging the padded row instead returns
+    ``(a + b + 8 * unknown) / 10``, which is a different vector even when ``unknown`` is
+    zero, because the divisor is 10 rather than 2.
+
+    A row with no real positions at all averages to zeros rather than dividing by zero.
+    """
+    weights = mask.to(vectors.dtype).unsqueeze(-1)
+    total = (vectors * weights).sum(dim=1)
+    count = weights.sum(dim=1).clamp(min=1.0)
+    return total / count
+
+
+class CBOWObjective(NegativeSamplingObjective):
     """Predict the centre word from the mean of its context word vectors.
 
     Trained with negative sampling rather than a full softmax: a 100k vocabulary makes
     the softmax denominator the whole cost of the model.
-    """
 
-    def __init__(self, vocabulary_size: int, dimension: int = 300) -> None:
-        super().__init__()
-        self.vocabulary_size = vocabulary_size
-        self.dimension = dimension
+    One training example per position, against Skip-gram's up to ``2 * window``. On
+    text8's roughly 17 million tokens that is 17 million examples per epoch against up to
+    170 million, so CBOW is around ten times faster and worse on rare words.
+    """
 
     def forward(
         self,
@@ -41,17 +66,12 @@ class CBOWObjective(nn.Module):
         Shapes: ``context_ids`` is (batch, context), ``centre_ids`` is (batch,),
         ``negative_ids`` is (batch, k). ``context_mask`` marks real context positions,
         which matters because the dynamic window makes contexts ragged.
+
+        Two lines. The first is the whole difference between CBOW and Skip-gram.
         """
-        raise NotImplementedError
-
-    def input_embeddings(self, average_with_context: bool = False) -> Tensor:
-        """Return the embedding matrix, (vocabulary, dimension).
-
-        This is the artefact the rest of the project consumes. With
-        ``average_with_context`` the centre and context matrices are averaged instead.
-        """
-        raise NotImplementedError
-
-    def to_device(self, device: torch.device) -> CBOWObjective:
-        """Move to a device. MPS on this machine, CPU in CI."""
-        raise NotImplementedError
+        context_vectors = self.input_matrix(context_ids)
+        if context_mask is None:
+            hidden = context_vectors.mean(dim=1)
+        else:
+            hidden = masked_average(context_vectors, context_mask)
+        return self.negative_sampling_loss(hidden, centre_ids, negative_ids)

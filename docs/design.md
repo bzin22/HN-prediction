@@ -405,6 +405,11 @@ ages, and gets the instant from a live read of the HN API instead.
 
 ## Embeddings
 
+The implementation and the measurements behind it are in
+[`word2vec.md`](word2vec.md): the two matrices, why negative sampling, why plain SGD, the
+CPU-against-MPS throughput result, and the overnight training chain. This section holds the
+hyperparameters and the plan.
+
 ### Terminology
 
 CBOW and Skip-gram are training **objectives**, not embeddings. You train a model on a

@@ -64,8 +64,24 @@ notebook: ## Phase 1. Re-execute the EDA notebook in place, outputs and all
 	$(BIN)/jupyter execute --inplace notebooks/01-eda.ipynb
 
 .PHONY: train-embeddings
-train-embeddings: ## Phase 3. Train one word2vec objective
+train-embeddings: ## Phase 3. Train one word2vec objective over one corpus
 	$(BIN)/python -m hn_upvotes.embeddings.train
+
+.PHONY: throughput
+throughput: ## Phase 3. Measure sparse gradients and tokens/s on CPU against MPS
+	$(BIN)/python -m hn_upvotes.embeddings.throughput
+
+.PHONY: chain-dry-run
+chain-dry-run: ## Phase 3. Walk all four overnight stages on synthetic corpora, seconds
+	$(BIN)/python -m hn_upvotes.embeddings.chain --dry-run \
+		--output-directory artifacts/embeddings-dry-run
+
+# The real overnight run. Detached, so it survives the terminal closing, and it writes
+# artifacts/embeddings/run-manifest.json as it goes. Reads that file in the morning, not the
+# log. Add --resume to carry on from the newest checkpoint of each stage.
+.PHONY: chain
+chain: ## Phase 3. Launch the four-stage overnight chain, detached
+	$(BIN)/python -m hn_upvotes.embeddings.chain --detach
 
 .PHONY: serve
 serve: ## Phase 6. Run the prediction service locally
