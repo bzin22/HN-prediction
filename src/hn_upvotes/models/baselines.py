@@ -46,6 +46,7 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
+from hn_upvotes.data.splits import DEFAULT_VALIDATION_START, validation_tail_mask
 from hn_upvotes.features.body import BODY_FEATURE_NAMES, build_body_features, strip_html_column
 from hn_upvotes.features.domain import extract_hostnames, has_url
 from hn_upvotes.features.history import PriorConfig, prior_mean
@@ -451,6 +452,133 @@ class AllSignalsXGBoost(AllSignalsRidge):
         )
         self.model.fit(matrix, np.asarray(targets, dtype=np.float32))
         return self
+
+
+class EarlyStoppedXGBoost(AllSignalsXGBoost):
+    """Rung 6, stopped by a held-out number instead of by a fixed tree count.
+
+    Same features, same depth, same learning rate, same ``max_bin`` as
+    :class:`AllSignalsXGBoost`. One thing changes: ``n_estimators`` goes from 500 to a
+    ceiling of 5,000 and training ends when the validation RMSE has not improved for
+    ``early_stopping_rounds`` rounds. The ceiling is high enough that early stopping is
+    what ends the run; if the run reaches it, the number measured is the ceiling and the
+    result has to say so.
+
+    The question it answers: 500 trees at depth 6 is at most 31,500 splits, against
+    100,010 columns, so the untuned rung could not have looked at most of its own feature
+    matrix. Either the run stops early, and 500 trees was already more than the model
+    could use, or it runs long and keeps improving, and 500 was starving it.
+
+    **The validation slice is the last months of the training period, never a random
+    sample.** ``data.splits.cut_validation_tail`` is where that is enforced. A random
+    slice would let the tree count be chosen on posts from the same weeks the model
+    trained on. The test period is not touched: it is scored once, at the end.
+
+    The vectorisers and the scaler are fitted on the earlier part only, so the validation
+    slice is out of sample all the way down to the vocabulary, not just for the trees.
+    """
+
+    def __init__(
+        self,
+        author: AuthorMeanPredictor,
+        domain: DomainMeanPredictor,
+        first_validation_month: str = DEFAULT_VALIDATION_START,
+        max_features: int = 50_000,
+        ngram_range: tuple[int, int] = (1, 2),
+        n_estimators: int = 5_000,
+        max_depth: int = 6,
+        learning_rate: float = 0.1,
+        max_bin: int = 64,
+        n_jobs: int = -1,
+        early_stopping_rounds: int = 50,
+        verbose_every: int = 25,
+    ) -> None:
+        super().__init__(
+            author, domain, max_features, ngram_range, n_estimators, max_depth,
+            learning_rate, max_bin, n_jobs,
+        )  # fmt: skip
+        self.first_validation_month = first_validation_month
+        self.early_stopping_rounds = early_stopping_rounds
+        self.verbose_every = verbose_every
+        self.fit_rows = 0
+        self.validation_rows = 0
+        self.best_iteration = 0
+        self.validation_rmse: list[float] = []
+
+    def fit(self, frame: pd.DataFrame, targets: np.ndarray) -> EarlyStoppedXGBoost:
+        """Cut the validation tail off the end, fit on what is left, stop on the tail."""
+        from xgboost import XGBRegressor
+
+        every = np.asarray(targets, dtype=np.float32)
+        held_back = validation_tail_mask(frame["time"], self.first_validation_month)
+        fit_frame, validation_frame = frame.loc[~held_back], frame.loc[held_back]
+        self.fit_rows, self.validation_rows = int((~held_back).sum()), int(held_back.sum())
+        if not self.fit_rows or not self.validation_rows:
+            raise ValueError(
+                f"{self.first_validation_month} leaves {self.fit_rows:,} rows to fit on and "
+                f"{self.validation_rows:,} to validate on; both have to be non-empty"
+            )
+
+        matrix = self.features.fit_transform(fit_frame)
+        validation_matrix = self.features.transform(validation_frame)
+
+        self.model = XGBRegressor(
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            learning_rate=self.learning_rate,
+            max_bin=self.max_bin,
+            tree_method="hist",
+            n_jobs=self.n_jobs,
+            random_state=0,
+            eval_metric="rmse",
+            early_stopping_rounds=self.early_stopping_rounds,
+        )
+        self.model.fit(
+            matrix,
+            every[~held_back],
+            eval_set=[(validation_matrix, every[held_back])],
+            verbose=self.verbose_every,
+        )
+        self.best_iteration = int(self.model.best_iteration)
+        self.validation_rmse = [float(v) for v in self.model.evals_result()["validation_0"]["rmse"]]
+        return self
+
+    def predict(self, frame: pd.DataFrame, trees: int | None = None) -> np.ndarray:
+        """Predict with the first ``trees`` trees, or with the best round if not given.
+
+        XGBoost already truncates at the best round when early stopping fired, but this
+        says so out loud, and the ``trees`` argument is how the same fitted model gets
+        scored at 500 trees for the comparison against the untuned rung.
+        """
+        end = self.best_iteration + 1 if trees is None else trees
+        matrix = self.features.transform(frame)
+        return np.asarray(self.model.predict(matrix, iteration_range=(0, end)))
+
+    @property
+    def trees_built(self) -> int:
+        """Rounds actually run, including the ones after the best that failed to improve."""
+        return len(self.validation_rmse)
+
+    def predictions_by_tree_count(
+        self, frame: pd.DataFrame, counts: list[int]
+    ) -> dict[int, np.ndarray]:
+        """One set of predictions per tree count, off a single fitted model.
+
+        Early stopping watches RMSE, because that is what the objective minimises, and
+        this project ranks on Spearman. Those can come apart: error can flatten while
+        ordering is still improving. Scoring the same model at a ladder of tree counts is
+        how that shows up, and it costs one feature transform rather than one refit per
+        count.
+
+        Counts above what the run actually built are dropped rather than clamped, so a
+        row in the output always means the trees existed.
+        """
+        matrix = self.features.transform(frame)
+        return {
+            count: np.asarray(self.model.predict(matrix, iteration_range=(0, count)))
+            for count in counts
+            if 0 < count <= self.trees_built
+        }
 
 
 def titles(frame: pd.DataFrame) -> pd.Series:

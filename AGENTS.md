@@ -187,8 +187,9 @@ costs sit outside it and are not measured: gensim's half of each gate, and the H
 reader's real throughput. If it stops fitting, cut epochs on the HN stages, not an objective.
 
 Embedding tests need the `train` extra, which the base install and the main CI job do not
-carry, so they `importorskip`. The separate `embeddings` CI job installs the CPU torch wheel and
-runs them; without that job they would never run anywhere.
+carry, so they `importorskip`. The separate `train-extra` CI job installs the CPU torch wheel
+and runs them; without that job they would never run anywhere. Anything else needing that
+extra has to be added to that job by name, or it silently never runs.
 
 ## Maintaining this file
 

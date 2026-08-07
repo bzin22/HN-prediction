@@ -18,9 +18,11 @@ import pytest
 from hn_upvotes.data.ingest import UNSETTLED_SCORE_MONTHS
 from hn_upvotes.data.splits import (
     DEFAULT_SPLIT,
+    DEFAULT_VALIDATION_START,
     SplitConfig,
     TemporalSplit,
     assert_no_temporal_overlap,
+    cut_validation_tail,
     split_stories,
     to_temporal_split,
 )
@@ -71,6 +73,50 @@ def test_a_split_that_would_train_on_the_future_is_rejected():
     )
     with pytest.raises(ValueError, match="after test starts"):
         to_temporal_split(overlapping)
+
+
+def test_no_validation_row_is_earlier_than_any_row_fitted_on():
+    """The property early stopping depends on. A random slice would break it."""
+    train = split_stories(_monthly_frame())["train"]
+    parts = cut_validation_tail(train)
+    assert len(parts["fit"]) > 0
+    assert len(parts["validation"]) > 0
+    assert parts["fit"]["time"].max() < parts["validation"]["time"].min()
+
+
+def test_the_validation_tail_takes_the_end_of_the_training_period_and_nothing_else():
+    train = split_stories(_monthly_frame())["train"]
+    parts = cut_validation_tail(train)
+    # No row is lost or duplicated, and the tail ends where training ends.
+    assert len(parts["fit"]) + len(parts["validation"]) == len(train)
+    assert parts["validation"]["time"].max() == train["time"].max()
+    assert set(parts["validation"]["time"].dt.strftime("%Y-%m")) == {
+        "2021-12", "2022-01", "2022-02", "2022-03", "2022-04", "2022-05",
+        "2022-06", "2022-07", "2022-08", "2022-09", "2022-10", "2022-11",
+    }  # fmt: skip
+
+
+def test_the_validation_tail_never_reaches_the_test_period():
+    parts = split_stories(_monthly_frame())
+    tail = cut_validation_tail(parts["train"])["validation"]
+    assert tail["time"].max() < parts["test"]["time"].min()
+
+
+def test_the_default_validation_start_is_twelve_months_of_training_data():
+    # Verified against data/stories.parquet on 2026-08-07: 2021-12 onward is 296,531 of
+    # the 3,568,252 training rows, 8.3%, leaving 3,271,721 to fit on.
+    assert DEFAULT_VALIDATION_START == "2021-12"
+    boundary = pd.Timestamp(f"{DEFAULT_VALIDATION_START}-01")
+    train_end = pd.Timestamp(f"{DEFAULT_SPLIT.train_end}-01") + pd.offsets.MonthBegin(1)
+    assert (train_end.year - boundary.year) * 12 + train_end.month - boundary.month == 12
+
+
+def test_a_validation_tail_with_nothing_on_one_side_is_rejected():
+    train = split_stories(_monthly_frame())["train"]
+    with pytest.raises(ValueError, match="validation tail is empty"):
+        cut_validation_tail(train, "2030-01")
+    with pytest.raises(ValueError, match="nothing left to fit on"):
+        cut_validation_tail(train, "2000-01")
 
 
 def test_an_empty_interval_is_rejected():

@@ -12,6 +12,10 @@ written here: it is read from ``ingest.UNSETTLED_SCORE_MONTHS`` through
 
 The boundaries are :class:`SplitConfig`, not literals in code, so moving the cut is a
 config change and shows up as one in a diff.
+
+A model that has to stop on a held-out number gets a third slice, the validation tail:
+the last months of the training period, cut off by :func:`cut_validation_tail`. It is a
+cut on the same time axis for the same reason. The test period is never involved.
 """
 
 from __future__ import annotations
@@ -46,6 +50,20 @@ class SplitConfig:
 
 #: The Phase 2 split. Import this rather than constructing a config at a call site.
 DEFAULT_SPLIT = SplitConfig()
+
+#: First month of the validation tail held back from the training split, for anything that
+#: has to stop on a held-out number: XGBoost's early stopping is the first such thing.
+#:
+#: 2021-12 to 2022-11 inclusive, the last twelve months of the training period. A full year
+#: rather than a shorter tail because a shorter one is a season, and a model picked on
+#: three winter months is picked on winter. Measured against ``data/stories.parquet`` on
+#: 2026-08-07: 296,531 validation rows, 8.3% of the training split, leaving 3,271,721 rows
+#: to fit on.
+#:
+#: **This is a cut on the time axis and it cannot be anything else.** A random validation
+#: split would let a model choose its stopping point using posts from the same weeks it
+#: trained on, which is the leak this project is built to avoid.
+DEFAULT_VALIDATION_START = "2021-12"
 
 
 @dataclass(frozen=True)
@@ -122,6 +140,44 @@ def assert_no_temporal_overlap(split: TemporalSplit) -> None:
             f"train ends at {split.train_end}, after test starts at {split.test_start}. "
             "A test row earlier than a training row makes the whole result meaningless."
         )
+
+
+def validation_tail_mask(
+    times: pd.Series,
+    first_validation_month: str = DEFAULT_VALIDATION_START,
+) -> np.ndarray:
+    """Which rows fall in the validation tail, as a positional boolean mask.
+
+    A mask rather than two frames because the caller usually has to cut a target array
+    the same way, and a mask cuts both without either one drifting from the other.
+
+    Every false row is strictly earlier than every true row, because the test is a single
+    ``>=`` against one month boundary. That is the property the whole thing rests on.
+    """
+    boundary = _month_start(first_validation_month)
+    stamps = pd.to_datetime(pd.Series(times).reset_index(drop=True))
+    return (stamps >= boundary).to_numpy()
+
+
+def cut_validation_tail(
+    frame: pd.DataFrame,
+    first_validation_month: str = DEFAULT_VALIDATION_START,
+    time_column: str = "time",
+) -> dict[str, pd.DataFrame]:
+    """Cut a training frame into the part fitted on and a validation tail after it.
+
+    The tail is the end of the training period, so a model that stops on it stops on
+    posts later than every post it learned from. Nothing here touches the test split.
+
+    Raises if the boundary leaves either side empty, because a validation slice of zero
+    rows would make early stopping fire on the first round and look like a real answer.
+    """
+    held_back = validation_tail_mask(frame[time_column], first_validation_month)
+    if not held_back.any():
+        raise ValueError(f"no rows at or after {first_validation_month}: validation tail is empty")
+    if held_back.all():
+        raise ValueError(f"no rows before {first_validation_month}: nothing left to fit on")
+    return {"fit": frame.loc[~held_back].copy(), "validation": frame.loc[held_back].copy()}
 
 
 def rows_before(times: np.ndarray, cutoff: pd.Timestamp) -> np.ndarray:
