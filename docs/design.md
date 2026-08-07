@@ -515,19 +515,47 @@ Phase 5, where a single run is not evidence.
 
 ### The reporting format
 
-The six baseline rungs are measured and their numbers are in the README. The fusion rows
-below are still empty, and are kept empty so the format is fixed before any number exists
-and cannot be chosen after the fact to flatter a result.
+This is the full table, all four metrics. The README carries the two error columns only.
+The fusion rows are kept empty so the format is fixed before any number exists and cannot
+be chosen after the fact to flatter a result.
 
 There is no separate "RMSE (target)" column any more. With the transform off the target
 *is* `log1p(score)`, so the two columns would hold the same number.
 
 | Model | RMSE (`log1p` score) | MAE (`log1p` score) | Spearman | P@100 |
 |---|---|---|---|---|
-| Baseline rungs 1 to 6 | see README | | | |
+| 1. Trailing mean | 1.191 | 0.854 | 0.050 | 0 |
+| 2. Author history | 1.210 | 0.844 | 0.176 | 1 |
+| 3. Domain history | 1.220 | 0.852 | 0.154 | 0 |
+| 4. Body text + Ridge | 1.197 | 0.808 | 0.040 | 2 |
+| 5. All signals + Ridge | **1.149** | **0.802** | **0.297** | 0 |
+| 6. All signals + XGBoost | 1.152 | 0.814 | 0.265 | 1 |
 | Early fusion | | | | |
 | Late fusion | | | | |
 | Hybrid fusion | | | | |
+
+Measured 2026-08-06 on 599,937 test rows. P@100 is a count out of 100, not a fraction.
+`make baselines` reproduces it into `artifacts/baselines.json`.
+
+#### What the two ranking columns say that error does not
+
+**Rank separates the rungs and error does not.** Rung 1 to rung 5 moves RMSE by 3.6%,
+from 1.191 to 1.149, and Spearman from 0.050 to 0.297, about six times. 49.5% of test
+posts score 1 or 2, so a constant is already close to half the data and there is little
+absolute error left to win. Order is a different question and the features do move it.
+Anyone reading the error columns alone will conclude the features are worthless. They are
+not; the error floor is just low.
+
+**No rung can find the top 100, and P@100 cannot tell them apart.** The 100th
+highest-scoring test post scored 1,707 points. Every rung hits between 0 and 2. Picking
+100 rows at random out of 599,937 has an expected hit count of
+
+    100 * 100 / 599,937 = 0.017
+
+so 0, 1 and 2 hits are all indistinguishable from chance. Rung 5 has the best rank
+correlation of any rung and hits zero. Use P@100 to show that nothing reaches the tail,
+not to rank models against each other. Ranking broadly and ranking the extreme tail are
+different skills, and it is the second one a submission-time predictor would be for.
 
 Embedding variants, downstream on the best fusion architecture:
 
