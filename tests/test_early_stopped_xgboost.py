@@ -85,6 +85,7 @@ def _fitted(frame: pd.DataFrame, targets: np.ndarray, **kwargs) -> EarlyStoppedX
         "n_estimators": 80,
         "early_stopping_rounds": 5,
         "verbose_every": 0,
+        "validation_sample_rows": None,
         **kwargs,
     }
     return EarlyStoppedXGBoost(author, domain, **settings).fit(frame, targets)
@@ -92,12 +93,29 @@ def _fitted(frame: pd.DataFrame, targets: np.ndarray, **kwargs) -> EarlyStoppedX
 
 def test_the_validation_tail_is_cut_by_time_not_by_row_order():
     frame, targets = _frame()
-    model = _fitted(frame, targets)
+    model = _fitted(frame, targets, validation_sample_rows=None)
 
     boundary = pd.Timestamp(f"{VALIDATION_START}-01")
-    assert model.validation_rows == int((frame["time"] >= boundary).sum())
-    assert model.fit_rows == len(frame) - model.validation_rows
+    assert model.held_back_rows == int((frame["time"] >= boundary).sum())
+    assert model.validation_rows == model.held_back_rows
+    assert model.fit_rows == len(frame) - model.held_back_rows
     assert model.fit_rows > 0 and model.validation_rows > 0
+
+
+def test_sampling_the_scored_rows_does_not_grow_the_fit_set():
+    """Rows held back but not scored are not handed back to training.
+
+    The whole point of the bound is per-round cost. If the dropped rows fell back into the
+    fit set, the sampled run and the unsampled run would be fitting different models and
+    nothing could be compared between them.
+    """
+    frame, targets = _frame()
+    unsampled = _fitted(frame, targets, validation_sample_rows=None)
+    sampled = _fitted(frame, targets, validation_sample_rows=40)
+
+    assert sampled.validation_rows == 40
+    assert sampled.held_back_rows == unsampled.held_back_rows
+    assert sampled.fit_rows == unsampled.fit_rows
 
 
 def test_the_vectorisers_never_see_the_validation_tail():

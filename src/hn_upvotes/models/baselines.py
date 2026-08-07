@@ -39,6 +39,9 @@ see the training split and nothing else.
 
 from __future__ import annotations
 
+import gc
+import logging
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Protocol
@@ -46,11 +49,18 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
-from hn_upvotes.data.splits import DEFAULT_VALIDATION_START, validation_tail_mask
+from hn_upvotes.data.splits import (
+    DEFAULT_VALIDATION_SAMPLE_ROWS,
+    DEFAULT_VALIDATION_START,
+    sample_validation_tail,
+    validation_tail_mask,
+)
 from hn_upvotes.features.body import BODY_FEATURE_NAMES, build_body_features, strip_html_column
 from hn_upvotes.features.domain import extract_hostnames, has_url
 from hn_upvotes.features.history import PriorConfig, prior_mean
 from hn_upvotes.features.temporal import TEMPORAL_FEATURE_NAMES, build_temporal_features
+
+logger = logging.getLogger(__name__)
 
 #: Settling lag, matching ``target.normalise.BaselineConfig.lag``. Phase 1 measured
 #: scores reaching their final level between 12 and 24 hours after submission.
@@ -470,13 +480,46 @@ class EarlyStoppedXGBoost(AllSignalsXGBoost):
     could use, or it runs long and keeps improving, and 500 was starving it.
 
     **The validation slice is the last months of the training period, never a random
-    sample.** ``data.splits.cut_validation_tail`` is where that is enforced. A random
-    slice would let the tree count be chosen on posts from the same weeks the model
-    trained on. The test period is not touched: it is scored once, at the end.
+    sample of the training period.** ``data.splits.validation_tail_mask`` is where that is
+    enforced. A slice drawn at random across the whole period would let the tree count be
+    chosen on posts from the same weeks the model trained on. The test period is not
+    touched: it is scored once, at the end.
+
+    What *is* sampled is which of those held-back rows get scored each round, bounded by
+    ``validation_sample_rows``. Every row after the boundary stays out of the fit set
+    either way, so the sampled rows are still strictly later than everything learned from,
+    and the fit set is identical whether sampling is on or off.
 
     The vectorisers and the scaler are fitted on the earlier part only, so the validation
     slice is out of sample all the way down to the vocabulary, not just for the trees.
+
+    **This rung calls ``xgboost.train`` directly instead of ``XGBRegressor``, and that is
+    a speed decision with a measurement behind it.** The scikit-learn wrapper builds an
+    eval set as a ``QuantileDMatrix``, which carries no incremental prediction cache, so
+    every round re-scores the whole validation slice from scratch. Measured on the real
+    matrix, 10 rounds each: 95.13 seconds a round through the wrapper against 4.52 through
+    the native API with a plain ``DMatrix`` eval, on the identical 296,531 row slice. A
+    5,000 tree run is six days one way and six hours the other. The rest of the ladder
+    keeps the wrapper, because nothing else on it passes an eval set.
     """
+
+    #: Boosting parameters, in the native API's names. ``learning_rate``, ``max_depth`` and
+    #: ``max_bin`` come from the untuned rung unchanged, so the tree count is the only
+    #: difference between the two.
+    def _params(self, base_score: float) -> dict:
+        return {
+            "objective": "reg:squarederror",
+            "eval_metric": "rmse",
+            "max_depth": self.max_depth,
+            "learning_rate": self.learning_rate,
+            "max_bin": self.max_bin,
+            "tree_method": "hist",
+            "nthread": self.n_jobs,
+            "seed": 0,
+            # Set rather than left to the default, because the two APIs pick a starting
+            # value differently and the untuned rung got the wrapper's, which is the mean.
+            "base_score": base_score,
+        }
 
     def __init__(
         self,
@@ -492,6 +535,8 @@ class EarlyStoppedXGBoost(AllSignalsXGBoost):
         n_jobs: int = -1,
         early_stopping_rounds: int = 50,
         verbose_every: int = 25,
+        validation_sample_rows: int | None = DEFAULT_VALIDATION_SAMPLE_ROWS,
+        validation_sample_seed: int = 0,
     ) -> None:
         super().__init__(
             author, domain, max_features, ngram_range, n_estimators, max_depth,
@@ -500,48 +545,85 @@ class EarlyStoppedXGBoost(AllSignalsXGBoost):
         self.first_validation_month = first_validation_month
         self.early_stopping_rounds = early_stopping_rounds
         self.verbose_every = verbose_every
+        self.validation_sample_rows = validation_sample_rows
+        self.validation_sample_seed = validation_sample_seed
         self.fit_rows = 0
+        self.held_back_rows = 0
         self.validation_rows = 0
         self.best_iteration = 0
+        self.boosting_seconds = 0.0
         self.validation_rmse: list[float] = []
 
     def fit(self, frame: pd.DataFrame, targets: np.ndarray) -> EarlyStoppedXGBoost:
         """Cut the validation tail off the end, fit on what is left, stop on the tail."""
-        from xgboost import XGBRegressor
+        import xgboost as xgb
 
         every = np.asarray(targets, dtype=np.float32)
-        held_back = validation_tail_mask(frame["time"], self.first_validation_month)
-        fit_frame, validation_frame = frame.loc[~held_back], frame.loc[held_back]
-        self.fit_rows, self.validation_rows = int((~held_back).sum()), int(held_back.sum())
+        in_tail = validation_tail_mask(frame["time"], self.first_validation_month)
+        evaluated = sample_validation_tail(
+            in_tail, self.validation_sample_rows, self.validation_sample_seed
+        )
+        self.fit_rows = int((~in_tail).sum())
+        self.held_back_rows = int(in_tail.sum())
+        self.validation_rows = int(evaluated.sum())
         if not self.fit_rows or not self.validation_rows:
             raise ValueError(
                 f"{self.first_validation_month} leaves {self.fit_rows:,} rows to fit on and "
                 f"{self.validation_rows:,} to validate on; both have to be non-empty"
             )
+        logger.info(
+            "fitting on %s rows, holding back %s from %s and scoring %s of them each round",
+            f"{self.fit_rows:,}",
+            f"{self.held_back_rows:,}",
+            self.first_validation_month,
+            f"{self.validation_rows:,}",
+        )
 
-        matrix = self.features.fit_transform(fit_frame)
-        validation_matrix = self.features.transform(validation_frame)
+        matrix = self.features.fit_transform(frame.loc[~in_tail])
+        validation_matrix = self.features.transform(frame.loc[evaluated])
+        fit_target, validation_target = every[~in_tail], every[evaluated]
+        # The frames are several GB with body text on 3.3 million rows, and the matrices
+        # are built. Holding both while boosting pushed the first attempt into swap and
+        # cost about 100 seconds a round; see docs/design.md.
+        del frame, targets, every
+        gc.collect()
 
-        self.model = XGBRegressor(
-            n_estimators=self.n_estimators,
-            max_depth=self.max_depth,
-            learning_rate=self.learning_rate,
-            max_bin=self.max_bin,
-            tree_method="hist",
-            n_jobs=self.n_jobs,
-            random_state=0,
-            eval_metric="rmse",
+        # QuantileDMatrix for training, because it bins once and holds the bins rather
+        # than the values. Plain DMatrix for the eval, because that is the one XGBoost
+        # keeps a prediction cache for, and the cache is the difference between 4.5
+        # seconds a round and 95.
+        train_data = xgb.QuantileDMatrix(matrix, label=fit_target, max_bin=self.max_bin)
+        validation_data = xgb.DMatrix(validation_matrix, label=validation_target)
+        del matrix, validation_matrix
+        gc.collect()
+
+        history: dict = {}
+        started = time.perf_counter()
+        self.model = xgb.train(
+            self._params(float(fit_target.mean())),
+            train_data,
+            num_boost_round=self.n_estimators,
+            evals=[(validation_data, "validation")],
             early_stopping_rounds=self.early_stopping_rounds,
+            evals_result=history,
+            verbose_eval=self.verbose_every,
+            callbacks=[_round_timer(self.verbose_every)],
         )
-        self.model.fit(
-            matrix,
-            every[~held_back],
-            eval_set=[(validation_matrix, every[held_back])],
-            verbose=self.verbose_every,
-        )
+        self.boosting_seconds = time.perf_counter() - started
         self.best_iteration = int(self.model.best_iteration)
-        self.validation_rmse = [float(v) for v in self.model.evals_result()["validation_0"]["rmse"]]
+        self.validation_rmse = [float(v) for v in history["validation"]["rmse"]]
+        logger.info(
+            "%s rounds in %.0fs, %.2fs a round",
+            self.trees_built,
+            self.boosting_seconds,
+            self.seconds_per_round,
+        )
         return self
+
+    @property
+    def seconds_per_round(self) -> float:
+        """Wall clock per boosting round. The number that decides whether a run is viable."""
+        return self.boosting_seconds / self.trees_built if self.trees_built else 0.0
 
     def predict(self, frame: pd.DataFrame, trees: int | None = None) -> np.ndarray:
         """Predict with the first ``trees`` trees, or with the best round if not given.
@@ -550,9 +632,11 @@ class EarlyStoppedXGBoost(AllSignalsXGBoost):
         says so out loud, and the ``trees`` argument is how the same fitted model gets
         scored at 500 trees for the comparison against the untuned rung.
         """
+        import xgboost as xgb
+
         end = self.best_iteration + 1 if trees is None else trees
-        matrix = self.features.transform(frame)
-        return np.asarray(self.model.predict(matrix, iteration_range=(0, end)))
+        data = xgb.DMatrix(self.features.transform(frame))
+        return np.asarray(self.model.predict(data, iteration_range=(0, end)))
 
     @property
     def trees_built(self) -> int:
@@ -573,12 +657,50 @@ class EarlyStoppedXGBoost(AllSignalsXGBoost):
         Counts above what the run actually built are dropped rather than clamped, so a
         row in the output always means the trees existed.
         """
-        matrix = self.features.transform(frame)
+        import xgboost as xgb
+
+        data = xgb.DMatrix(self.features.transform(frame))
         return {
-            count: np.asarray(self.model.predict(matrix, iteration_range=(0, count)))
+            count: np.asarray(self.model.predict(data, iteration_range=(0, count)))
             for count in counts
             if 0 < count <= self.trees_built
         }
+
+
+def _round_timer(every: int):  # noqa: ANN202 - xgboost callback, imported lazily
+    """Log seconds per boosting round every ``every`` rounds.
+
+    A run at 3 seconds a round finishes 5,000 trees in four hours and a run at 100 seconds
+    a round takes six days. The difference does not show up in any output XGBoost prints,
+    so it is logged here and the log is what says whether to let a run continue.
+
+    The class is defined inside the function because ``xgboost`` is imported inside ``fit``
+    and this module has to stay importable without the ``train`` extra.
+    """
+    from xgboost.callback import TrainingCallback
+
+    class RoundTimer(TrainingCallback):
+        def before_training(self, model):  # noqa: ANN001, ANN202
+            self.started = self.marked = time.perf_counter()
+            self.marked_round = 0
+            return model
+
+        def after_iteration(self, model, epoch: int, evals_log) -> bool:  # noqa: ANN001
+            done = epoch + 1
+            if every and done % every == 0:
+                now = time.perf_counter()
+                since = done - self.marked_round
+                logger.info(
+                    "round %s, %.2fs a round over the last %s, %.0fs so far",
+                    done,
+                    (now - self.marked) / since,
+                    since,
+                    now - self.started,
+                )
+                self.marked, self.marked_round = now, done
+            return False
+
+    return RoundTimer()
 
 
 def titles(frame: pd.DataFrame) -> pd.Series:

@@ -31,6 +31,7 @@ Needs the ``data`` extra for DuckDB and the ``train`` extra for scikit-learn and
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import time
@@ -97,6 +98,9 @@ class FitResult:
     reuses_a_fit: bool = False
     validation_rmse: list[float] = field(default_factory=list)
     test_metrics_by_tree_count: dict[int, MetricReport] = field(default_factory=dict)
+    seconds_per_round: float = 0.0
+    rows_held_back: int = 0
+    rows_scored_each_round: int = 0
 
     def as_dict(self) -> dict:
         out = {
@@ -108,6 +112,10 @@ class FitResult:
             "note": self.note,
             **self.metrics.as_dict(),
         }
+        if self.seconds_per_round:
+            out["seconds_per_round"] = round(self.seconds_per_round, 3)
+            out["rows_held_back"] = self.rows_held_back
+            out["rows_scored_each_round"] = self.rows_scored_each_round
         if self.validation_rmse:
             out["validation_rmse_per_round"] = [round(v, 6) for v in self.validation_rmse]
         if self.test_metrics_by_tree_count:
@@ -126,6 +134,11 @@ def run(
     """Fit the four models and score every one of them on the untouched test split."""
     parts = split_stories(frame, config)
     train, test = parts["train"], parts["test"]
+    # The source table is 4.7 million rows carrying body text, and the split has already
+    # copied out everything still needed. Holding it alongside the feature matrices is
+    # what put the first attempt into swap.
+    del frame, parts
+    gc.collect()
     held_back = validation_tail_mask(train["time"], first_validation_month)
     logger.info(
         "train %s rows, of which %s held back from %s as validation, leaving %s to fit on. "
@@ -149,6 +162,10 @@ def run(
     author.fit(history, history_target)
     domain = DomainMeanPredictor(fallback=TrailingMeanPredictor(), min_posts=1)
     domain.fit(history, history_target)
+    # Both predictors kept their own copy of the times, keys and targets they need, which
+    # is three columns rather than seven, so the concatenated frame can go.
+    del history, history_target
+    gc.collect()
 
     results = []
 
@@ -166,6 +183,10 @@ def run(
         )
     )
     _log(results[-1])
+    # Its vectorisers hold a 100,010 term vocabulary and the fitted matrix is no longer
+    # needed, so it goes before the next fit rather than after the run.
+    del ridge
+    gc.collect()
 
     logger.info("fitting Ridge on the training split minus the validation tail")
     started = time.perf_counter()
@@ -185,6 +206,8 @@ def run(
         )
     )
     _log(results[-1])
+    del short_ridge
+    gc.collect()
 
     logger.info("fitting XGBoost with early stopping. This is the long one")
     model = EarlyStoppedXGBoost(author, domain, first_validation_month=first_validation_month)
@@ -218,13 +241,21 @@ def run(
             model.fit_rows,
             trees=best_trees,
             note=(
-                f"Stopped early at round {best_trees} of {model.n_estimators}."
-                if stopped_early
-                else f"Ran to the {model.n_estimators} tree ceiling. The ceiling ended it, "
-                "not early stopping, so this number is a floor on the useful tree count."
+                (
+                    f"Stopped early at round {best_trees} of {model.n_estimators}."
+                    if stopped_early
+                    else f"Ran to the {model.n_estimators} tree ceiling. The ceiling ended "
+                    "it, not early stopping, so this is a floor on the useful tree count."
+                )
+                + f" {model.held_back_rows:,} rows held back from {first_validation_month},"
+                f" {model.validation_rows:,} of them scored each round,"
+                f" at {model.seconds_per_round:.2f}s a round."
             ),
             validation_rmse=model.validation_rmse,
             test_metrics_by_tree_count=curve,
+            seconds_per_round=model.seconds_per_round,
+            rows_held_back=model.held_back_rows,
+            rows_scored_each_round=model.validation_rows,
         )
     )
     _log(results[-1])

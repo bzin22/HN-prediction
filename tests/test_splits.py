@@ -23,8 +23,10 @@ from hn_upvotes.data.splits import (
     TemporalSplit,
     assert_no_temporal_overlap,
     cut_validation_tail,
+    sample_validation_tail,
     split_stories,
     to_temporal_split,
+    validation_tail_mask,
 )
 
 
@@ -109,6 +111,47 @@ def test_the_default_validation_start_is_twelve_months_of_training_data():
     boundary = pd.Timestamp(f"{DEFAULT_VALIDATION_START}-01")
     train_end = pd.Timestamp(f"{DEFAULT_SPLIT.train_end}-01") + pd.offsets.MonthBegin(1)
     assert (train_end.year - boundary.year) * 12 + train_end.month - boundary.month == 12
+
+
+def test_sampling_the_tail_can_only_ever_drop_rows_never_add_them():
+    """The property that keeps sampling from touching strictly-earlier.
+
+    A sampled row was already in the tail, so it is still later than every fitted row. The
+    danger would be a sampler that reached back across the boundary, and a mask that is a
+    strict subset of the tail mask cannot.
+    """
+    train = split_stories(_monthly_frame())["train"]
+    in_tail = validation_tail_mask(train["time"])
+    sampled = sample_validation_tail(in_tail, sample_rows=4, seed=0)
+
+    assert sampled.sum() == 4
+    assert not (sampled & ~in_tail).any(), "sampling invented a row outside the tail"
+
+
+def test_sampling_is_seeded_so_a_rerun_scores_the_same_rows():
+    train = split_stories(_monthly_frame())["train"]
+    in_tail = validation_tail_mask(train["time"])
+    first = sample_validation_tail(in_tail, sample_rows=5, seed=0)
+    assert (first == sample_validation_tail(in_tail, sample_rows=5, seed=0)).all()
+    assert not (first == sample_validation_tail(in_tail, sample_rows=5, seed=1)).all()
+
+
+def test_asking_for_more_rows_than_the_tail_holds_keeps_all_of_them():
+    train = split_stories(_monthly_frame())["train"]
+    in_tail = validation_tail_mask(train["time"])
+    assert (sample_validation_tail(in_tail, sample_rows=10_000) == in_tail).all()
+    assert (sample_validation_tail(in_tail, sample_rows=None) == in_tail).all()
+
+
+def test_sampling_does_not_move_a_dropped_row_into_the_fit_set():
+    """A row held back but not scored is scored by nothing, and fitted on by nothing."""
+    train = split_stories(_monthly_frame())["train"]
+    unsampled = cut_validation_tail(train)
+    sampled = cut_validation_tail(train, sample_rows=3)
+
+    assert len(sampled["validation"]) == 3
+    assert len(sampled["fit"]) == len(unsampled["fit"]), "the fit set has to be untouched"
+    assert sampled["fit"]["time"].max() < sampled["validation"]["time"].min()
 
 
 def test_a_validation_tail_with_nothing_on_one_side_is_rejected():
