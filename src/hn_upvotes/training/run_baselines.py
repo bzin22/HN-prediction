@@ -176,14 +176,16 @@ def _with_note(result: RungResult, note: str) -> RungResult:
 def markdown_table(results: list[RungResult]) -> str:
     """The table that goes in the README."""
     lines = [
-        "| Rung | RMSE (`log1p` score) | MAE (`log1p` score) | Spearman | P@100 |",
+        "| Rung | RMSE | MAE | Spearman | P@100 |",
         "|---|---|---|---|---|",
     ]
     for r in results:
         m = r.metrics
+        # P@100 as a count out of 100 rather than a fraction. At this k the numbers are
+        # 0, 1 or 2, and "0.01" reads as a rate when it is one post.
         lines.append(
-            f"| {r.name} | {m.rmse_log1p_score:.4f} | {m.mae_log1p_score:.4f} "
-            f"| {m.spearman_raw_score:.4f} | {m.precision_at_100:.2f} |"
+            f"| {r.name} | {m.rmse_log1p_score:.3f} | {m.mae_log1p_score:.3f} "
+            f"| {m.spearman_raw_score:.3f} | {m.precision_at_100 * 100:.0f} |"
         )
     return "\n".join(lines)
 

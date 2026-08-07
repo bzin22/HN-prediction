@@ -85,6 +85,23 @@ test 2024-01 to 2025-12, and the two unsettled windows dropped. The boundaries a
 `data/splits.SplitConfig`, not literals. Walk-forward is deferred until one number is
 shown to be hiding something; `splits.walk_forward_folds` is the seam and says so.
 
+**Report rank, not just error, and never quote RMSE alone.** The six baselines move RMSE
+by 3.6% end to end (1.191 to 1.149) and Spearman by six times (0.050 to 0.297). 49.5% of
+test posts score 1 or 2, so a constant is already near half the data and absolute error
+has almost nothing left to win. An RMSE-only table would read as "nothing works".
+
+**Precision@100 does not discriminate at this scale.** Every rung scores 0, 1 or 2 hits,
+and 100 random rows out of 599,937 would be expected to hit 0.017 times. Use it to show
+that nothing finds the tail, not to rank models. The full numbers are in the README and
+`artifacts/baselines.json`.
+
+**Body text is a distribution shift, not just a sparse feature.** Body text was added to
+the allowlist in Phase 2, so the legal feature set is now title, `by`, `url`, `time` and
+`text`. It carries a trap: 6.6% of training rows have body text against 9.9% of test
+rows, and link posts with a body comment are 0.9% of train against 5.0% of test. The
+practice grew. Any figure quoted for body text has to say which period it is measured
+over, and the widely quoted 11.6% is a 2025 number, not a full-history one (7.4%).
+
 Terminology: CBOW and Skip-gram are training objectives. The embedding is the input
 weight matrix kept after the task is discarded. "CBOW embeddings" is wrong here.
 
