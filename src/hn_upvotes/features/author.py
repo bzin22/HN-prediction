@@ -47,15 +47,16 @@ def expanding_author_stats(
     targets: pd.Series,
     config: AuthorStatsConfig | None = None,
 ) -> pd.DataFrame:
-    """Per-row author track record, computed from strictly earlier posts only.
-
-    ``targets`` is the normalised target, not the raw score, so the statistic is not
-    itself contaminated by era drift.
+    """Per-row author track record, as feature columns, from strictly earlier posts only.
 
     Returns columns ``author_prior_count``, ``author_prior_mean`` and
     ``author_prior_std``, aligned to the input rows.
+
+    Not needed yet. The statistic itself is implemented and tested in
+    ``features.history.prior_mean``, which rung 2 of the baseline ladder calls directly.
+    This wrapper is the feature-column form the fusion models will want.
     """
-    raise NotImplementedError
+    raise NotImplementedError("the statistic is implemented in features.history.prior_mean")
 
 
 class AuthorEncoder:

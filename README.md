@@ -1,16 +1,17 @@
 # Hacker News upvote prediction
 
 Predicts the score a Hacker News post will get, using only what is knowable at the
-moment it is submitted: the title, the account posting it, the linked domain, and the
-timestamp.
+moment it is submitted: the title, the body text under it, the account posting it, the
+linked host, and the timestamp.
 
 Word embeddings are trained from scratch in PyTorch, both the CBOW and the Skip-gram
 objective, with negative sampling. Three fusion architectures combine the title vector
-with the author, domain and time signals. Validation is walk-forward on the time axis.
+with the other signals. Validation is a single cut on the time axis: train on 2006 to
+2022, test on 2024 and 2025.
 
-**Status: Phase 1 done.** The data is ingested and the three gates have run. No model has
-been trained yet. The reasoning behind every design choice, with the plots and the
-reporting format, is in [`docs/design.md`](docs/design.md).
+**Status: Phase 2 done.** Six baseline models are measured on that split and the numbers
+are below. No neural network has been trained yet. The reasoning behind every design
+choice, with the plots, is in [`docs/design.md`](docs/design.md).
 
 ## The data
 
@@ -49,7 +50,7 @@ Every measurement behind them, with the plots, is in that design doc section and
 |---|---|---|
 | 0 | Repo, README, scaffold, CI | Done |
 | 1 | Ingest and EDA, three gates, leak audit | Done |
-| 2 | Baseline models to beat, walk-forward harness, tail drift confronted | Not started |
+| 2 | Time split, six baseline rungs, the metrics that report them | Done |
 | 3 | CBOW and Skip-gram on text8, validated against gensim, then the Wikipedia subset | Not started |
 | 4 | HN fine-tuning, three-variant comparison | Not started |
 | 5 | Early, late and hybrid fusion, plus ablations | Not started |
@@ -66,18 +67,31 @@ make check
 ```
 
 Heavy dependencies are optional extras, installed with `pip install -e ".[data]"` and so
-on for `train` and `serve`.
+on for `train` and `serve`. `make baselines` reproduces the table above and needs both
+`data` and `train`.
+
+Rung 6 uses XGBoost, which is a separate package with a scikit-learn compatible
+estimator, not part of scikit-learn. It needs an OpenMP runtime, which macOS does not
+ship. `make baselines` points at the copy scikit-learn's own wheel already carries, so
+nothing extra is needed; `brew install libomp` is the official alternative.
 
 ## Repository layout
 
 Code is `src/hn_upvotes/`, split into `data/`, `embeddings/`, `features/`, `target/`,
 `models/`, `training/` and `serving/`. Implemented so far:
 [`features/schema.py`](src/hn_upvotes/features/schema.py),
+[`features/history.py`](src/hn_upvotes/features/history.py),
+[`features/body.py`](src/hn_upvotes/features/body.py),
+[`features/domain.py`](src/hn_upvotes/features/domain.py),
+[`features/temporal.py`](src/hn_upvotes/features/temporal.py),
 [`target/normalise.py`](src/hn_upvotes/target/normalise.py),
 [`data/ingest.py`](src/hn_upvotes/data/ingest.py),
-[`data/preprocess.py`](src/hn_upvotes/data/preprocess.py) and
-[`data/gates.py`](src/hn_upvotes/data/gates.py). Everything else is a stub carrying its
-real type-annotated signature and a docstring saying what it will do.
+[`data/splits.py`](src/hn_upvotes/data/splits.py),
+[`data/preprocess.py`](src/hn_upvotes/data/preprocess.py),
+[`data/gates.py`](src/hn_upvotes/data/gates.py),
+[`models/baselines.py`](src/hn_upvotes/models/baselines.py) and
+[`training/metrics.py`](src/hn_upvotes/training/metrics.py). Everything else is a stub
+carrying its real type-annotated signature and a docstring saying what it will do.
 
 ## Hardware
 

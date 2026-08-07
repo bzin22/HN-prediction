@@ -15,10 +15,18 @@ old `<3.13` cap existed because torch and gensim lagged; both cleared 3.13 by 20
 
 Heavy dependencies are optional extras (`data`, `train`, `serve`), so a default install
 has no torch. `dev` is a normal extra rather than a dependency group, because dependency
-groups are a uv concept that pip cannot install. Modules under `embeddings/`, `models/`,
-`training/` and `serving/` import their extra at module level and will not import without
-it. Keep `src/hn_upvotes/__init__.py` free of submodule imports so `import hn_upvotes`
-stays cheap and dependency free.
+groups are a uv concept that pip cannot install. Most modules under `embeddings/`,
+`models/`, `training/` and `serving/` import their extra at module level and will not
+import without it. `models/baselines.py` is the exception on purpose: it imports
+scikit-learn and xgboost inside `fit`, so the numpy-only rungs and their tests run on a
+base install and CI does not need the `train` extra. Keep `src/hn_upvotes/__init__.py`
+free of submodule imports so `import hn_upvotes` stays cheap and dependency free.
+
+xgboost needs an OpenMP runtime, which macOS does not ship, so `import xgboost` fails
+with a `libomp.dylib` error out of the box. `brew install libomp` is the official fix.
+`make baselines` avoids needing it by pointing `DYLD_LIBRARY_PATH` at the copy
+scikit-learn's own wheel already carries inside `.venv`. Run rung 5 any other way and
+that variable has to be set the same way.
 
 ## Column names are Hacker News's, not ours
 
@@ -39,7 +47,12 @@ These are enforced by tests. Do not weaken either to make something pass.
    independently, so editing `schema.py` cannot take the test with it.
 2. **Strictly earlier.** Every rolling statistic and every split is computed from rows
    strictly before the row it serves. No random splits anywhere. The reference
-   implementation of the window bound is `target/normalise.compute_trailing_baseline`.
+   implementation of the window bound is `target/normalise.compute_trailing_baseline`,
+   and `features/history.prior_mean` is the same bound keyed by author or hostname.
+   Every rung of the baseline ladder goes through one of those two, so there is one
+   place to get it wrong. The easy mistake is a mean taken over the whole training set
+   and then applied to every row of that key; `tests/test_author_history_bound.py`
+   exists to catch exactly that.
 
 ## Design decisions that are argued, not incidental
 
@@ -63,9 +76,14 @@ corrected the tail either, not that there is nothing to correct. The machinery i
 and is one config change to re-enable. Do not re-enable it without a statistic that
 actually tracks the tail.
 
-**Tail drift is an open risk, not a closed finding.** It is unhandled, and Phase 2's
-walk-forward folds are where it has to be dealt with. Spearman and P@100 are the metrics
-that will expose it.
+**Tail drift is an open risk, not a closed finding.** It is unhandled. Phase 2 measured
+it on one cut rather than on walk-forward folds, so the fold-over-fold degradation
+sequence does not exist yet. Spearman and P@100 are the metrics that expose it.
+
+**Phase 2 chose a single time-based cut, not walk-forward.** Train 2006-10 to 2022-11,
+test 2024-01 to 2025-12, and the two unsettled windows dropped. The boundaries are
+`data/splits.SplitConfig`, not literals. Walk-forward is deferred until one number is
+shown to be hiding something; `splits.walk_forward_folds` is the seam and says so.
 
 Terminology: CBOW and Skip-gram are training objectives. The embedding is the input
 weight matrix kept after the task is discarded. "CBOW embeddings" is wrong here.
@@ -83,7 +101,11 @@ All four are encoded in `data/ingest.py`; the evidence is in `docs/design.md`.
 3. Missing values are sentinels, not `NULL`. An absent title is `''`, an absent score
    is `0`, so an `IS NOT NULL` filter silently keeps everything.
 4. `time` is `TIMESTAMP_MICROS` in UTC, not unix seconds. Cast with `AT TIME ZONE 'UTC'`
-   or every month boundary shifts.
+   or every month boundary shifts. **This applies to the source shards only.** Ingest
+   already applied that cast, so `time` in `data/stories.parquet` is a plain naive UTC
+   `TIMESTAMP`. Casting it a second time reinterprets it in the session timezone and
+   silently moves rows across month boundaries: it moved 226 rows out of the Phase 2
+   training segment before the counts were checked against the known totals.
 
 ## Maintaining this file
 

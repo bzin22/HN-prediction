@@ -22,7 +22,18 @@ from collections.abc import Iterable
 #: ``by``     the submitting account
 #: ``url``    the linked address, absent for text posts
 #: ``time``   the submission timestamp, unix seconds in the source dump
-ALLOWED_FEATURE_COLUMNS: frozenset[str] = frozenset({"title", "by", "url", "time"})
+#: ``text``   the body the poster wrote under the headline, HTML as the API returns it
+#:
+#: ``text`` was added in Phase 2 as a deliberate widening of the allowlist, not an
+#: incidental edit. It is legal for the same reason the other four are: the poster wrote
+#: it before pressing submit, so its value is fixed at submission time and reading it is
+#: not circular. That is the whole test, and ``score``, ``descendants`` and ``kids`` still
+#: fail it because all three only acquire a value after the post is live.
+#:
+#: The measurement behind the decision: 11.6% of stories carry body text, and link
+#: submissions over 1,000 characters of body reach the top 5% of scores 8.1% of the time
+#: against 5.1% for a bare link.
+ALLOWED_FEATURE_COLUMNS: frozenset[str] = frozenset({"title", "by", "url", "time", "text"})
 
 #: Columns that only acquire a value after the post is live. Never a feature.
 #:

@@ -49,6 +49,16 @@ ingest: ## Phase 1. Build the stories table from the Parquet dump
 clean-shards: ## Phase 1. Delete the monthly shards. Safe once ingest reports its count
 	rm -rf data/shards
 
+# Rung 5 needs an OpenMP runtime, which macOS does not ship. The official answer is
+# `brew install libomp`. scikit-learn's wheel already carries a copy inside the venv, so
+# this points at that one and the target works with no system package. Empty and ignored
+# on Linux, where the xgboost wheel bundles its own runtime.
+OMP_DIR := $(shell ls -d $(VENV)/lib/python*/site-packages/sklearn/.dylibs 2>/dev/null | head -1)
+
+.PHONY: baselines
+baselines: ## Phase 2. Fit the five baseline rungs and print the results table
+	DYLD_LIBRARY_PATH="$(OMP_DIR)" $(BIN)/python -m hn_upvotes.training.run_baselines
+
 .PHONY: notebook
 notebook: ## Phase 1. Re-execute the EDA notebook in place, outputs and all
 	$(BIN)/jupyter execute --inplace notebooks/01-eda.ipynb

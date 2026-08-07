@@ -23,7 +23,10 @@ data = [
     "nbformat>=5.10",
     "nbclient>=0.10",
 ]
-train = ["torch>=2.3", "scikit-learn>=1.5", "gensim>=4.3", "tqdm>=4.66"]
+# xgboost is its own package, not part of scikit-learn. It presents a scikit-learn
+# compatible estimator (`XGBRegressor`), so rung 5 of the baseline ladder is the same
+# fit/predict shape as rung 4 and takes the same sparse matrix.
+train = ["torch>=2.3", "scikit-learn>=1.5", "xgboost>=2.1", "gensim>=4.3", "tqdm>=4.66"]
 serve = ["fastapi>=0.111", "pydantic>=2.7", "uvicorn>=0.30"]
 
 # A normal extra rather than a [dependency-groups] entry, because dependency groups are
