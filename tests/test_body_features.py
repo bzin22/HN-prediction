@@ -45,6 +45,6 @@ def test_length_is_measured_on_the_prose_and_not_the_markup():
 
 
 def test_no_body_and_a_short_body_are_told_apart():
-    """88.4% of rows have no body. Without the flag they collide with a two-word one."""
+    """Over 90% of rows have no body. Without the flag they collide with a two-word one."""
     features = build_body_features(strip_html_column(pd.Series(["", "hi"])))
     assert features["has_body_text"].tolist() == [0.0, 1.0]

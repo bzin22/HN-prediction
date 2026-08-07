@@ -30,9 +30,10 @@ from collections.abc import Iterable
 #: not circular. That is the whole test, and ``score``, ``descendants`` and ``kids`` still
 #: fail it because all three only acquire a value after the post is live.
 #:
-#: The measurement behind the decision: 11.6% of stories carry body text, and link
-#: submissions over 1,000 characters of body reach the top 5% of scores 8.1% of the time
-#: against 5.1% for a bare link.
+#: The measurement behind the decision: link submissions carrying over 1,000 characters
+#: of body reach the top 5% of scores 8.1% of the time against 5.1% for a bare link.
+#: 11.3% of stories carried body text over 2025-04 to 2025-06, though only 7.4% do across
+#: the whole table, because the practice grew.
 ALLOWED_FEATURE_COLUMNS: frozenset[str] = frozenset({"title", "by", "url", "time", "text"})
 
 #: Columns that only acquire a value after the post is live. Never a feature.

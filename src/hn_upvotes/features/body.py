@@ -1,7 +1,8 @@
 """Body text features: the text under the headline, its length, and whether it exists.
 
 ``text`` is Hacker News's own name for the body the poster writes under the title. Most
-posts do not have one: 11.6% of stories carry body text, measured on the full table.
+posts do not have one: 7.4% of stories across the whole table, 6.6% of the training split
+and 9.9% of the test split.
 
 Three things come out of the column, and the second and third matter as much as the
 first:
@@ -13,9 +14,9 @@ first:
   link submission carrying over 1,000 characters of body reaches the top 5% of scores
   8.1% of the time against 5.1% for a bare link. A sparse bag of words recovers that
   slowly if at all, so it is handed over directly.
-* **Whether there is any body at all**, as a flag. 88.4% of rows have none. Without the
-  flag an empty body is an all-zero row, which is also what a body of two common words
-  looks like after vectorising, and the two are not the same thing.
+* **Whether there is any body at all**, as a flag. Over 90% of rows have none. Without
+  the flag an empty body is an all-zero row, which is also what a body of two common
+  words looks like after vectorising, and the two are not the same thing.
 
 The body arrives as HTML, because that is what the API returns: paragraph breaks are
 ``<p>``, links are ``<a href="...">``, and quotes and ampersands are escaped entities.
