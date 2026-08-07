@@ -492,42 +492,74 @@ rather than asserting it.
 
 ## Evaluation
 
-Primary metrics are RMSE and MAE on the normalised target, because that is the space the
-model trains in. A normalised error is hard to read alone, so three more are reported:
+Four metrics, in `training/metrics.py`:
 
-- **RMSE on `log1p(score)`**, after mapping predictions back through the test period's
-  trailing baseline. Quotable in real score terms.
+- **RMSE and MAE on `log1p(score)`**, the space the model trains in. With the transform
+  off that is also the space a score can be read back out of, so no mapping is needed.
 - **Spearman correlation on raw score.** Ranking quality is what a submission-time
-  predictor is for, and Spearman is invariant to the whole normalisation, so it is the
-  metric the target transform cannot flatter.
+  predictor is for, and rank is immune to the tail inflating across the split, which
+  absolute error is not. `log1p` is strictly increasing, so Spearman on raw score and on
+  `log1p(score)` are the same number and it is computed in the latter.
 - **Precision@100.** Of the top 100 posts the model predicts, how many really landed
-  high.
+  high. Absolute error can look respectable while the ranking at the top is worthless.
 
-Validation is walk-forward rather than a single early/late cut. Train on a window, test
-on the window immediately after, roll forward, repeat. Drift within each fold is small,
-and the sequence of scores shows whether the model degrades as it ages. A single split
-gives one number and hides that.
+Validation is a single time-based cut: train 2006-10 to 2022-11, test 2024-01 to 2025-12,
+with the two unsettled windows dropped. Walk-forward was the original plan and is
+deferred, on the grounds that it is worth its cost once one number is shown to be hiding
+something. What it would expose is tail drift, and Spearman and Precision@100 are already
+reported on the single cut. `splits.walk_forward_folds` is the seam.
 
-Every number is quoted as mean plus or minus standard deviation across five seeds. A
-single run is not evidence. Where two models differ by less than the seed noise, they
-are reported as indistinguishable rather than ranked.
+The baseline rungs are deterministic given the split, so there is no seed noise to quote
+for them. The five-seed mean and standard deviation applies to the fusion models from
+Phase 5, where a single run is not evidence.
 
 ### The reporting format
 
-**Nothing here has been measured.** These tables are the shape of the output, kept empty
-so the format is fixed before any number exists and cannot be chosen after the fact to
-flatter a result. They fill in from Phase 2 onward.
+This is the full table, all four metrics. The README carries the first three; Precision@100
+is here only, because it cannot separate the rungs and the reason takes a paragraph. The
+fusion rows are kept empty so the format is fixed before any number exists and cannot be
+chosen after the fact to flatter a result.
 
-| Model | RMSE (target) | MAE (target) | RMSE (`log1p` score) | Spearman | P@100 |
-|---|---|---|---|---|---|
-| 1. Trailing baseline | | | | | |
-| 2. Author mean | | | | | |
-| 3. Domain mean | | | | | |
-| 4. TF-IDF + Ridge | | | | | |
-| 5. TF-IDF + GBM | | | | | |
-| Early fusion | | | | | |
-| Late fusion | | | | | |
-| Hybrid fusion | | | | | |
+There is no separate "RMSE (target)" column any more. With the transform off the target
+*is* `log1p(score)`, so the two columns would hold the same number.
+
+| Model | RMSE (`log1p` score) | MAE (`log1p` score) | Spearman | P@100 |
+|---|---|---|---|---|
+| 1. Trailing mean | 1.191 | 0.854 | 0.050 | 0 |
+| 2. Author history | 1.210 | 0.844 | 0.176 | 1 |
+| 3. Domain history | 1.220 | 0.852 | 0.154 | 0 |
+| 4. Body text + Ridge | 1.197 | 0.808 | 0.040 | 2 |
+| 5. All signals + Ridge | **1.149** | **0.802** | **0.297** | 0 |
+| 6. All signals + XGBoost | 1.152 | 0.814 | 0.265 | 1 |
+| Early fusion | | | | |
+| Late fusion | | | | |
+| Hybrid fusion | | | | |
+
+Measured 2026-08-06 on 599,937 test rows. P@100 is a count out of 100, not a fraction.
+`make baselines` reproduces it into `artifacts/baselines.json`.
+
+#### What the ranking columns say that error does not
+
+**Rank separates the rungs and error does not.** Rung 1 to rung 5 moves RMSE by 3.6%,
+from 1.191 to 1.149, and Spearman from 0.050 to 0.297, about six times. 49.5% of test
+posts score 1 or 2, so a constant is already close to half the data and there is little
+absolute error left to win. Order is a different question and the features do move it.
+Anyone reading the error columns alone will conclude the features are worthless. They are
+not; the error floor is just low. This is the Phase 2 headline and the README leads with
+it.
+
+**No rung can find the top 100, and P@100 cannot tell them apart.** This is why that
+column is not on the front page: it is worth measuring and it is not worth ranking on. The
+100th
+highest-scoring test post scored 1,707 points. Every rung hits between 0 and 2. Picking
+100 rows at random out of 599,937 has an expected hit count of
+
+    100 * 100 / 599,937 = 0.017
+
+so 0, 1 and 2 hits are all indistinguishable from chance. Rung 5 has the best rank
+correlation of any rung and hits zero. Use P@100 to show that nothing reaches the tail,
+not to rank models against each other. Ranking broadly and ranking the extreme tail are
+different skills, and it is the second one a submission-time predictor would be for.
 
 Embedding variants, downstream on the best fusion architecture:
 
@@ -559,18 +591,34 @@ Implementation check against gensim on the same corpus:
 
 ### Baseline ladder
 
-Built before any neural network, so there is a real bar to clear. Every rung predicts in
-normalised target space, the same space the fusion models train in.
+Built before any neural network, so there is a real bar to clear. Every rung predicts
+`log1p(score)` directly, because Phase 1 switched the trailing z-score off.
 
-1. Predict the trailing baseline, which in normalised space is just zero
-2. Author historical mean, time aware
-3. Domain historical mean, time aware
-4. TF-IDF plus Ridge
-5. TF-IDF plus gradient boosting
+| Rung | Sees | Model |
+|---|---|---|
+| 1 | nothing | trailing mean of `log1p(score)` |
+| 2 | the author | that author's trailing mean |
+| 3 | the hostname | that hostname's trailing mean |
+| 4 | the body text | TF-IDF of the body, its length, has-body, into Ridge |
+| 5 | everything | Ridge |
+| 6 | everything | XGBoost |
 
-Rung 5 sees the same four modalities as the fusion models, without learned
-representations, so it is the honest comparison. If no fusion model beats it, the README
-says so. An honest negative result reads better than a suspiciously good number.
+"Everything" is the title, the body text, the two trailing means, whether there is a
+link, and the hour and weekday. Rungs 1 to 4 are single-signal so each one isolates what
+one input is worth. Rungs 5 and 6 take the identical matrix, so the gap between them is
+linear against non-linear and nothing else.
+
+Rung 6 sees the same modalities as the fusion models, without learned representations, so
+it is the honest comparison. If no fusion model beats it, the README says so. An honest
+negative result reads better than a suspiciously good number.
+
+Body text was added to the feature allowlist in Phase 2. It is legal because the poster
+writes it before pressing submit, so it is not post-hoc the way the score, the comment
+count and the reply ids are. The measurement behind the decision, on 2025-04 to 2025-06
+with the top 5% bar at 84 points: a link submission carrying over 1,000 characters of
+body reaches the top 5% 8.1% of the time, against 5.1% for a bare link. The effect is
+largely a length effect, so length is a feature in its own right rather than something a
+bag of words has to rediscover.
 
 ## References
 

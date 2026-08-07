@@ -31,7 +31,10 @@ def cyclical_encode(values: np.ndarray, period: int) -> tuple[np.ndarray, np.nda
     Hour 23 and hour 0 are one apart, but as raw integers they are 23 apart. Projecting
     onto a circle fixes that, and costs one extra column.
     """
-    raise NotImplementedError
+    if period <= 0:
+        raise ValueError(f"period must be positive, got {period}")
+    angle = 2.0 * np.pi * np.asarray(values, dtype=np.float64) / period
+    return np.sin(angle), np.cos(angle)
 
 
 def hour_of_day(times: pd.Series) -> np.ndarray:
@@ -40,12 +43,12 @@ def hour_of_day(times: pd.Series) -> np.ndarray:
     Left in UTC rather than converted to a local timezone. The audience for a post is
     the site's readership, which is global, so the site's own clock is the right one.
     """
-    raise NotImplementedError
+    return _times(times).dt.hour.to_numpy(dtype=np.int64)
 
 
 def day_of_week(times: pd.Series) -> np.ndarray:
     """Day of week, Monday as 0."""
-    raise NotImplementedError
+    return _times(times).dt.dayofweek.to_numpy(dtype=np.int64)
 
 
 def build_temporal_features(times: pd.Series) -> pd.DataFrame:
@@ -54,4 +57,24 @@ def build_temporal_features(times: pd.Series) -> pd.DataFrame:
     The only input is the ``time`` column, which is on the submission-time allowlist in
     ``features.schema``.
     """
-    raise NotImplementedError
+    hour = hour_of_day(times)
+    day = day_of_week(times)
+    hour_sin, hour_cos = cyclical_encode(hour, 24)
+    dow_sin, dow_cos = cyclical_encode(day, 7)
+    return pd.DataFrame(
+        {
+            "hour_sin": hour_sin,
+            "hour_cos": hour_cos,
+            "dow_sin": dow_sin,
+            "dow_cos": dow_cos,
+            "is_weekend": (day >= 5).astype(np.float64),
+        },
+        columns=list(TEMPORAL_FEATURE_NAMES),
+    )
+
+
+def _times(times: pd.Series) -> pd.Series:
+    """The one coercion, shared with the target transform."""
+    from hn_upvotes.target.normalise import to_datetime
+
+    return to_datetime(times)

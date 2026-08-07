@@ -51,9 +51,13 @@ SOURCE_COLUMNS: tuple[str, ...] = (
     "words",
 )
 
-#: The eight columns pulled across the full history. ``text`` and ``words`` are the two
-#: large ones (6.18 GB and 4.67 GB of the 11.93 GB total) and are left behind; ``words``
-#: is sampled for one month by :func:`load_words_sample`.
+#: The nine columns pulled across the full history. ``words`` is the one large column
+#: left behind (4.67 GB of the 11.93 GB total); it is sampled for one month by
+#: :func:`load_words_sample`.
+#:
+#: ``text`` is the body the poster wrote under the headline. Its 6.18 GB headline figure
+#: covers all 49 million items and is dominated by 45 million comment bodies, so the
+#: story-only share is far smaller. It is a legal feature: it exists at submission.
 #:
 #: ``score`` and ``descendants`` are here because they are needed to build and to audit
 #: the target, not because they are features. ``features/schema.py`` rejects both.
@@ -62,6 +66,7 @@ PROJECTED_COLUMNS: tuple[str, ...] = (
     "type",
     "time",
     "title",
+    "text",
     "score",
     "by",
     "url",
@@ -142,6 +147,7 @@ _STORY_PROJECTION = """
     type,
     time AT TIME ZONE 'UTC' AS time,
     title,
+    text,
     score,
     "by",
     url,
@@ -363,7 +369,10 @@ def download_shard(con, month: str, shard_dir: Path, overwrite: bool = False) ->
     shard_dir = Path(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
     out = shard_dir / f"{month}.parquet"
-    if out.exists() and not overwrite:
+    # A shard written before a change to PROJECTED_COLUMNS is missing a column the
+    # caller now wants, and resuming would reuse it silently. Check the columns rather
+    # than the file name.
+    if out.exists() and not overwrite and _shard_is_current(con, out):
         return out
 
     year = month.split("-")[0]
@@ -384,6 +393,20 @@ def download_shard(con, month: str, shard_dir: Path, overwrite: bool = False) ->
     )
     tmp.replace(out)
     return out
+
+
+def _shard_is_current(con, shard: Path) -> bool:
+    """True if an existing shard carries every column in :data:`PROJECTED_COLUMNS`."""
+    try:
+        present = {
+            row[0]
+            for row in con.execute(
+                f"SELECT name FROM (DESCRIBE SELECT * FROM read_parquet('{shard}'))"
+            ).fetchall()
+        }
+    except Exception:  # noqa: BLE001 - a shard we cannot read is a shard we re-pull
+        return False
+    return set(PROJECTED_COLUMNS).issubset(present)
 
 
 def download_shards(

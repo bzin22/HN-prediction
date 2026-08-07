@@ -16,12 +16,23 @@ from hn_upvotes.features import schema
 # kids         direct child comment ids, the same information as a list
 BANNED = frozenset({"score", "descendants", "kids"})
 
-# The allowlist, also restated independently.
-EXPECTED_ALLOWLIST = frozenset({"title", "by", "url", "time"})
+# The allowlist, also restated independently. `text` joined it in Phase 2, as a
+# deliberate widening: the poster writes the body before pressing submit, so its value is
+# fixed at submission time. Adding a name here is the reviewed step, not a formality.
+EXPECTED_ALLOWLIST = frozenset({"title", "by", "url", "time", "text"})
 
 
-def test_allowlist_holds_only_the_four_submission_time_columns():
+def test_allowlist_holds_only_the_five_submission_time_columns():
     assert schema.ALLOWED_FEATURE_COLUMNS == EXPECTED_ALLOWLIST
+
+
+def test_body_text_is_allowed_and_the_banned_names_still_are_not():
+    """Pins the Phase 2 widening in both directions, so neither half drifts."""
+    assert "text" in schema.ALLOWED_FEATURE_COLUMNS
+    assert schema.validate_feature_set(["title", "text"]) == frozenset({"title", "text"})
+    for column in sorted(BANNED):
+        with pytest.raises(schema.LeakedFeatureError):
+            schema.validate_feature_set(["text", column])
 
 
 def test_no_post_hoc_column_is_allowlisted():
@@ -47,10 +58,11 @@ def test_validate_accepts_the_allowlist_and_returns_it():
 
 
 def test_validate_rejects_a_column_nobody_approved():
-    # `text` is real, is available at submission time, and is still rejected until
-    # somebody adds it deliberately. That is what makes this an allowlist.
+    # `id` is real, is available at submission time, and is still rejected until somebody
+    # adds it deliberately. That is what makes this an allowlist. It is bookkeeping, not
+    # a feature: a model that learned from the id would be reading submission order.
     with pytest.raises(schema.UnknownFeatureError):
-        schema.validate_feature_set(["title", "text"])
+        schema.validate_feature_set(["title", "id"])
 
 
 def test_leaked_columns_present_reports_what_a_frame_is_carrying():
