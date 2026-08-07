@@ -535,13 +535,18 @@ There is no separate "RMSE (target)" column any more. With the transform off the
 | 3. Domain history | 1.220 | 0.852 | 0.154 | 0 |
 | 4. Body text + Ridge | 1.197 | 0.808 | 0.040 | 2 |
 | 5. All signals + Ridge | **1.149** | **0.802** | **0.297** | 0 |
-| 6. All signals + XGBoost | 1.152 | 0.814 | 0.265 | 1 |
+| 6. All signals + XGBoost, 500 trees | 1.152 | 0.814 | 0.265 | 1 |
+| 6b. The same, early stopped at 2,303 trees | 1.149 | 0.809 | 0.280 | 0 |
 | Early fusion | | | | |
 | Late fusion | | | | |
 | Hybrid fusion | | | | |
 
-Measured 2026-08-06 on 599,937 test rows. P@100 is a count out of 100, not a fraction.
-`make baselines` reproduces it into `artifacts/baselines.json`.
+Measured 2026-08-06 on 599,937 test rows, rung 6b on 2026-08-07. P@100 is a count out of
+100, not a fraction. `make baselines` reproduces rungs 1 to 6 into
+`artifacts/baselines.json`, `make tune-xgboost` reproduces 6b into
+`artifacts/xgboost-early-stopping.json`. Rung 6b is fitted on 296,531 fewer rows than the
+rest, because those are the validation tail it stops on; see
+[Was rung 6 underfitting?](#was-rung-6-underfitting).
 
 #### What the ranking columns say that error does not
 
@@ -624,6 +629,136 @@ with the top 5% bar at 84 points: a link submission carrying over 1,000 characte
 body reaches the top 5% 8.1% of the time, against 5.1% for a bare link. The effect is
 largely a length effect, so length is a feature in its own right rather than something a
 bag of words has to rediscover.
+
+### Was rung 6 underfitting?
+
+Rung 6 lost to rung 5 on every metric and took eight times as long, 1,518 seconds against
+172, on an identical feature matrix. That is a strange result, and there was an obvious
+suspect. Depth 6 gives a tree at most 63 splits, so 500 trees is at most 31,500 splits
+against 100,010 columns. Most of the feature matrix was never looked at.
+
+One early-stopped run tests it. `make tune-xgboost`, in
+[`training/tune_xgboost.py`](../src/hn_upvotes/training/tune_xgboost.py). The ceiling goes
+from 500 trees to 5,000 and training ends when validation RMSE has not improved for 50
+rounds. Everything else is the untuned rung's settings, so the tree count is the only
+thing that changed. This is one run, not a search: depth, learning rate and column
+sampling are untouched.
+
+#### The validation slice
+
+It is the last twelve months of the training period, 2021-12 to 2022-11: 296,531 rows,
+8.3% of the training split, leaving 3,271,721 to fit on. `data/splits.cut_validation_tail`
+is the only place that decides it.
+
+**It is a cut on the time axis and it could not be anything else.** Strictly earlier is
+one of the two protected invariants. A random validation split would let the model pick
+its stopping point using posts from the same weeks it trained on, which is the leak the
+whole project is built to avoid. A full year rather than a shorter tail because a shorter
+tail is a season, and a tree count chosen on three winter months is chosen on winter.
+
+The vectorisers and the scaler are fitted on the earlier part only, so the slice is out of
+sample down to the vocabulary. Fitting TF-IDF over the whole training split and then
+stopping on part of it would tune the stopping point on text the model had already read.
+`tests/test_early_stopped_xgboost.py` plants a word that appears only after the boundary
+and asserts it never reaches the vocabulary.
+
+The test period, 2024-01 to 2025-12, is untouched throughout and scored once at the end.
+
+Holding the year back costs the model something, and that cost is measured rather than
+assumed. Ridge fitted on the reduced split scores 1.151 RMSE and 0.289 Spearman against
+1.149 and 0.297 on the full split. So the year is worth 0.008 of Spearman. Any larger gap
+is the model, not the missing rows.
+
+#### Two things that made the first attempt unviable, and the numbers
+
+The first attempt managed 25 trees in 42 minutes, about 100 seconds a round against the
+untuned rung's 3. At that rate 5,000 trees is six days. Ten rounds each on the real
+3,271,721 by 100,010 matrix found why.
+
+| Eval slice | scikit-learn wrapper | Native `xgboost.train` |
+|---|---|---|
+| All 296,531 tail rows | 95.13s a round | 4.52s a round |
+| 50,000 sampled tail rows | 20.40s a round | 3.70s a round |
+| No eval set at all | 5.12s a round | 3.52s a round |
+
+**The scikit-learn wrapper builds eval sets as a `QuantileDMatrix`, which carries no
+incremental prediction cache, so every round re-scores the whole slice from scratch.** A
+plain `DMatrix` in the eval list is cached and only the newest tree is applied. That single
+difference is 95.13 seconds against 4.52 on the identical slice, 21 times. Rung 6 calls the
+native API for that reason; the rest of the ladder keeps the wrapper, because nothing else
+on it passes an eval set. `base_score` is set explicitly to the training mean, because the
+two APIs pick a starting value differently and the untuned rung got the wrapper's.
+
+**The scored slice is also bounded to 50,000 rows**, which takes a further 18% off, 3.70
+against 4.52. Sampling cannot weaken strictly earlier: `sample_validation_tail` returns a
+subset of the tail mask, so a scored row was already held out, and the rows it drops are
+dropped from scoring only. They do not rejoin the fit set, so the sampled and unsampled
+runs fit the same model on the same rows.
+
+Read the wrapper row before concluding that an eval set is expensive. On the full slice
+the native API pays 1.0 second a round for it, not 90.
+
+#### The verdict: yes, and it does not matter
+
+**The underfitting hypothesis was right.** The run stopped at 2,303 trees, 4.6 times the
+untuned 500, and it stopped early rather than reaching the 5,000 ceiling, so 2,303 is a
+measurement and not the edge of the box. 2,353 rounds in 4,679 seconds, 1.99 a round.
+Validation RMSE fell from 1.2166 at round 500 to 1.2097 at round 2,303, and the whole
+descent is monotone. At depth 6 those 2,303 trees are 145,089 splits, which is finally the
+same order as the 100,010 columns; the untuned 31,500 was not.
+
+The test period agrees, off one fitted model with no refits, so only the tree count moves:
+
+| Trees | RMSE | MAE | Spearman | P@100 |
+|---|---|---|---|---|
+| 25 | 1.1634 | 0.8168 | 0.2222 | 0 |
+| 100 | 1.1587 | 0.8158 | 0.2415 | 0 |
+| 500 | 1.1530 | 0.8116 | 0.2635 | 0 |
+| 1,000 | 1.1509 | 0.8103 | 0.2715 | 0 |
+| 1,500 | 1.1499 | 0.8094 | 0.2759 | 0 |
+| 2,000 | 1.1492 | 0.8089 | 0.2787 | 0 |
+| 2,303 | 1.1490 | 0.8087 | 0.2799 | 0 |
+
+Early stopping watches RMSE because that is what the objective minimises, and this project
+ranks on Spearman, so the two could have come apart. They did not. Both improve all the way
+up and both flatten together.
+
+**And Ridge still wins.** The four rows that matter, all scored on the same untouched test
+period:
+
+| Model | Trees | Fitted on | RMSE | MAE | Spearman | Fit |
+|---|---|---|---|---|---|---|
+| 5. Ridge | | 3,568,252 | **1.1485** | **0.8025** | **0.2971** | 157s |
+| 5b. Ridge, year held back | | 3,271,721 | 1.1510 | 0.8003 | 0.2890 | 146s |
+| 6. XGBoost, 500 trees | 500 | 3,568,252 | 1.1520 | 0.8140 | 0.2650 | 1,518s |
+| 6b. XGBoost, early stopped | 2,303 | 3,271,721 | 1.1490 | 0.8087 | 0.2799 | 4,817s |
+
+Rank correlation 0.2799 against 0.2971. MAE 0.8087 against 0.8025. RMSE ties at three
+decimals and Ridge is ahead at four. **Gradient boosting costs 31 times Ridge's fit time
+to lose to it**, 4,817 seconds against 157.
+
+The held-back year does not explain it. Ridge fitted on the identical reduced rows still
+scores 0.2890, ahead of 0.2799. Nor does the reduced training set hurt XGBoost much: the
+same model truncated to 500 trees scores 0.2635 against the untuned rung's 0.2650 on the
+full split, so the missing year is worth 0.0015 to it and 0.0081 to Ridge.
+
+So of the original 0.032 gap in rank correlation between rung 5 and rung 6, underfitting
+accounts for 0.0165, about half. The other half is real. **Trees are the wrong model for
+this matrix, and more of them will not fix it.** A hundred thousand mostly-zero TF-IDF
+columns is what a linear model is good at and what an axis-aligned split is bad at.
+
+#### What was not done, and what to do if anyone wants to push it
+
+**No hyperparameter search.** One run, one changed setting. A baseline tuned until it wins
+has stopped being a baseline, and rung 6 exists to be the bar the fusion models clear, not
+to win.
+
+If someone does want to push it, the tree count is not the knob. Ranking gained 0.004 over
+the last 800 trees, so doubling again buys perhaps 0.003 against a 0.009 gap to Ridge on
+like-for-like rows. **Depth is the candidate, not count.** Recommended, not run.
+
+The 500 tree row in the README stays visible next to the early-stopped one on purpose. The
+untuned number is what the ladder was built with and what the Phase 2 write-up argued from.
 
 ## References
 
