@@ -8,22 +8,21 @@ Skip-gram generates one training pair per context position instead of one per wi
 it sees more updates per token, trains slower, and generally does better on rare words.
 Comparing the two on the downstream task is one of the experiments this project runs.
 
+Everything except the forward pass lives in
+:mod:`hn_upvotes.embeddings.negative_sampling`, which this shares with CBOW.
+
 Needs the ``train`` extra.
 """
 
 from __future__ import annotations
 
-import torch
-from torch import Tensor, nn
+from torch import Tensor
+
+from hn_upvotes.embeddings.negative_sampling import NegativeSamplingObjective
 
 
-class SkipGramObjective(nn.Module):
+class SkipGramObjective(NegativeSamplingObjective):
     """Predict context words from the centre word, with negative sampling."""
-
-    def __init__(self, vocabulary_size: int, dimension: int = 300) -> None:
-        super().__init__()
-        self.vocabulary_size = vocabulary_size
-        self.dimension = dimension
 
     def forward(
         self,
@@ -35,13 +34,10 @@ class SkipGramObjective(nn.Module):
 
         Shapes: ``centre_ids`` and ``context_ids`` are (batch,) paired positives,
         ``negative_ids`` is (batch, k).
+
+        No averaging step, so no mask. The window has already been flattened into one
+        pair per context position by the feeder, and a padded position produces no pair at
+        all rather than a masked one.
         """
-        raise NotImplementedError
-
-    def input_embeddings(self, average_with_context: bool = False) -> Tensor:
-        """Return the embedding matrix, (vocabulary, dimension)."""
-        raise NotImplementedError
-
-    def to_device(self, device: torch.device) -> SkipGramObjective:
-        """Move to a device. MPS on this machine, CPU in CI."""
-        raise NotImplementedError
+        hidden = self.input_matrix(centre_ids)
+        return self.negative_sampling_loss(hidden, context_ids, negative_ids)
