@@ -56,39 +56,38 @@ One time-based split: 3,568,252 training rows from 2006-10 to 2022-11 and 599,93
 rows from 2024-01 to 2025-12. The 571,018 rows between and after them are dropped because
 the archive recorded those scores at submission, before anyone had voted.
 
-Six baselines, all predicting `log1p(score)`. Error is reported here; the two ranking
-metrics are in [`docs/design.md`](docs/design.md#the-reporting-format) with the rest of
-the table.
+Six baselines, all predicting `log1p(score)`. Spearman is rank correlation: it compares
+two orderings and ignores the actual numbers, 1 if they order posts identically and 0 if
+there is no relationship. Precision@100 is in
+[`docs/design.md`](docs/design.md#the-reporting-format) with the full table.
 
-| Rung | Sees | RMSE | MAE |
-|---|---|---|---|
-| 1. Trailing mean | nothing | 1.191 | 0.854 |
-| 2. Author history | the account | 1.210 | 0.844 |
-| 3. Domain history | the linked host | 1.220 | 0.852 |
-| 4. Body text + Ridge | the body text | 1.197 | 0.808 |
-| 5. All signals + Ridge | everything | **1.149** | **0.802** |
-| 6. All signals + XGBoost | everything | 1.152 | 0.814 |
+| Rung | Sees | RMSE | MAE | Spearman |
+|---|---|---|---|---|
+| 1. Trailing mean | nothing | 1.191 | 0.854 | 0.050 |
+| 2. Author history | the account | 1.210 | 0.844 | 0.176 |
+| 3. Domain history | the linked host | 1.220 | 0.852 | 0.154 |
+| 4. Body text + Ridge | the body text | 1.197 | 0.808 | 0.040 |
+| 5. All signals + Ridge | everything | **1.149** | **0.802** | **0.297** |
+| 6. All signals + XGBoost | everything | 1.152 | 0.814 | 0.265 |
 
-**All signals into Ridge is the strongest rung and is the bar Phase 5 has to clear.** It
-wins on both columns, 1.149 and 0.802, and it is the only rung that beats the do-nothing
-floor on both at once.
+**The models learn order, not magnitude. That is the Phase 2 result.** Rung 1 to rung 5
+spreads Spearman sixfold, 0.050 to 0.297, while RMSE moves 3.6%. The floor explains the
+gap: 49.5% of test posts score 1 or 2, so a constant already sits close to half the data
+and there is little absolute error left to win. Ordering is the question the features
+answer.
 
-**Error alone makes every rung look the same, and that is a fact about the data.** Rung 1
-knows nothing and predicts one number; rung 5 sees every signal and cuts RMSE by 3.6%.
-The floor explains it: 49.5% of test posts score 1 or 2, so a constant already sits close
-to half the data and there is very little absolute error left to win. Read these two
-columns as the error floor being low, not as the features being worthless. The ranking
-metrics in the design doc are what separate the rungs, and they separate them by a lot.
+**All signals into Ridge is the strongest rung** and the bar Phase 5 has to clear. It wins
+on all three columns.
 
 **Body text alone is close to the floor.** Rung 4 has the best MAE of the single-signal
-rungs, 0.808, and it gets there by lowering typical error rather than by telling posts
-apart. Only 9.9% of test rows carry any body, and the strongest pattern in the evidence, a
-link post with a long body comment, is 0.9% of training rows against 5.0% of test rows.
-The habit barely existed while the model was learning. Phase 3 should not count on the
-body as a second corpus without re-checking on recent data alone.
+rungs, 0.808, on a Spearman of 0.040, below rung 1's 0.050: it lowers typical error and
+does not order posts. Only 9.9% of test rows carry any body, and the strongest pattern in
+the evidence, a link post with a long body comment, is 0.9% of training rows against 5.0%
+of test rows. The habit barely existed while the model was learning. Phase 3 should not
+count on the body as a second corpus without re-checking on recent data alone.
 
 **Gradient boosting does not beat the linear model.** Rung 6 takes the identical matrix
-and is worse on both columns, for 25 minutes of fitting against 3.
+and is worse on all three columns, for 25 minutes of fitting against 3.
 
 Rung 2 falls back to rung 1 on the 10.0% of test rows whose author has no earlier post,
 rung 3 on the 13.8% whose host has none. `make baselines` reproduces all of it into

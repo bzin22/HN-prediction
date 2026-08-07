@@ -515,9 +515,10 @@ Phase 5, where a single run is not evidence.
 
 ### The reporting format
 
-This is the full table, all four metrics. The README carries the two error columns only.
-The fusion rows are kept empty so the format is fixed before any number exists and cannot
-be chosen after the fact to flatter a result.
+This is the full table, all four metrics. The README carries the first three; Precision@100
+is here only, because it cannot separate the rungs and the reason takes a paragraph. The
+fusion rows are kept empty so the format is fixed before any number exists and cannot be
+chosen after the fact to flatter a result.
 
 There is no separate "RMSE (target)" column any more. With the transform off the target
 *is* `log1p(score)`, so the two columns would hold the same number.
@@ -537,16 +538,19 @@ There is no separate "RMSE (target)" column any more. With the transform off the
 Measured 2026-08-06 on 599,937 test rows. P@100 is a count out of 100, not a fraction.
 `make baselines` reproduces it into `artifacts/baselines.json`.
 
-#### What the two ranking columns say that error does not
+#### What the ranking columns say that error does not
 
 **Rank separates the rungs and error does not.** Rung 1 to rung 5 moves RMSE by 3.6%,
 from 1.191 to 1.149, and Spearman from 0.050 to 0.297, about six times. 49.5% of test
 posts score 1 or 2, so a constant is already close to half the data and there is little
 absolute error left to win. Order is a different question and the features do move it.
 Anyone reading the error columns alone will conclude the features are worthless. They are
-not; the error floor is just low.
+not; the error floor is just low. This is the Phase 2 headline and the README leads with
+it.
 
-**No rung can find the top 100, and P@100 cannot tell them apart.** The 100th
+**No rung can find the top 100, and P@100 cannot tell them apart.** This is why that
+column is not on the front page: it is worth measuring and it is not worth ranking on. The
+100th
 highest-scoring test post scored 1,707 points. Every rung hits between 0 and 2. Picking
 100 rows at random out of 599,937 has an expected hit count of
 
