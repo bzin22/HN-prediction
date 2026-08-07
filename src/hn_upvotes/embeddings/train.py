@@ -29,6 +29,7 @@ from torch import Tensor
 
 from hn_upvotes.data.preprocess import Vocabulary, build_vocabulary, stream_corpus
 from hn_upvotes.embeddings.cbow import CBOWObjective
+from hn_upvotes.embeddings.checkpoint import Checkpoint, config_to_json
 from hn_upvotes.embeddings.negative_sampling import (
     NegativeSampler,
     NegativeSamplingObjective,
@@ -56,6 +57,11 @@ __all__ = [
     "subsample_tokens",
     "train_embeddings",
 ]
+
+#: Batches between wall-clock checks in the training loop. At roughly 10 ms a batch this
+#: overshoots a deadline by half a second at most, which is nothing against a two-hour
+#: budget, and keeps the clock read out of the inner loop.
+_DEADLINE_CHECK_STEPS = 50
 
 
 @dataclass(frozen=True)
@@ -146,7 +152,16 @@ class TrainedEmbeddings:
 
     ``tokens_per_second`` counts **in-vocabulary** corpus tokens, so words below
     ``min_count`` are not in it. On a Zipfian corpus of 2M tokens at ``min_count=5`` that
-    is 6.4% fewer than the raw token count.
+    is 6.4% fewer than the raw token count. On a resumed run it covers only the tokens this
+    call trained on, not the ones the checkpoint already had.
+
+    ``epoch_losses`` holds one entry per *completed* epoch. When a budget stops the run
+    part-way through an epoch, that epoch's mean loss goes in ``partial_epoch_loss`` instead,
+    so the list length and ``epochs_completed`` cannot drift apart across a resume.
+
+    ``cut_short`` is true when a wall-clock budget stopped the run before it finished its
+    epochs. The matrix is still usable and is still worth keeping; it just did not get the
+    training it was configured for, and nothing downstream should read it as if it did.
     """
 
     matrix: np.ndarray
@@ -154,6 +169,10 @@ class TrainedEmbeddings:
     config: SGNSConfig
     tokens_per_second: float
     epoch_losses: tuple[float, ...] = ()
+    epochs_completed: int = 0
+    cut_short: bool = False
+    tokens_trained: int = 0
+    partial_epoch_loss: float = float("nan")
 
     def save(self, path: Path) -> None:
         """Write matrix and vocabulary together, so they cannot drift apart."""
@@ -168,6 +187,10 @@ class TrainedEmbeddings:
             config=np.asarray(json.dumps(asdict(self.config))),
             tokens_per_second=np.asarray(self.tokens_per_second),
             epoch_losses=np.asarray(self.epoch_losses, dtype=np.float64),
+            epochs_completed=np.asarray(self.epochs_completed),
+            cut_short=np.asarray(self.cut_short),
+            tokens_trained=np.asarray(self.tokens_trained),
+            partial_epoch_loss=np.asarray(self.partial_epoch_loss),
         )
 
     @classmethod
@@ -187,6 +210,10 @@ class TrainedEmbeddings:
                 config=SGNSConfig(**json.loads(str(payload["config"]))),
                 tokens_per_second=float(payload["tokens_per_second"]),
                 epoch_losses=tuple(float(x) for x in payload["epoch_losses"]),
+                epochs_completed=int(payload["epochs_completed"]),
+                cut_short=bool(payload["cut_short"]),
+                tokens_trained=int(payload["tokens_trained"]),
+                partial_epoch_loss=float(payload["partial_epoch_loss"]),
             )
 
 
@@ -453,6 +480,10 @@ def train_embeddings_from_lines(
     output_path: Path | None = None,
     initial: TrainedEmbeddings | None = None,
     progress_every: int = 0,
+    checkpoint_directory: Path | None = None,
+    stage: str = "train",
+    resume: Checkpoint | None = None,
+    deadline: float | None = None,
 ) -> TrainedEmbeddings:
     """The training loop, over a callable that reopens the corpus for each epoch.
 
@@ -460,6 +491,20 @@ def train_embeddings_from_lines(
     corpus without writing a file, and so the throughput measurement can reuse it.
     ``reopen_corpus`` is called once per epoch and must return a fresh iterator of token
     lists.
+
+    The last four arguments are what unattended overnight operation needs:
+
+    ``checkpoint_directory``
+        Write a :class:`~hn_upvotes.embeddings.checkpoint.Checkpoint` after every epoch,
+        named for ``stage``. Both matrices go in, because resuming from the input matrix
+        alone would restart scoring from zero.
+    ``resume``
+        Carry on from a checkpoint instead of from a random initialisation. Skips the
+        epochs it already did.
+    ``deadline``
+        A ``time.monotonic()`` value. When it passes the loop stops between batches, saves
+        what it has, and returns with ``cut_short=True`` set on the artefact. It does not
+        pretend the run finished.
     """
     device = torch.device(config.device) if config.device else select_device()
     model = build_objective(config, len(vocabulary)).to_device(device)
@@ -477,9 +522,21 @@ def train_embeddings_from_lines(
     feeder = BatchFeeder(config, keep_probabilities, seed=config.seed)
     step = 0
     epoch_losses: list[float] = []
-    started = time.perf_counter()
+    partial_epoch_loss = float("nan")
+    first_epoch = 0
 
-    for epoch in range(config.epochs):
+    if resume is not None:
+        _load_checkpoint_into(model, resume)
+        first_epoch = resume.epochs_done
+        epoch_losses = list(resume.epoch_losses)
+        # Carried so the learning-rate schedule resumes at the right point rather than
+        # jumping back to the starting rate.
+        feeder.tokens_read = resume.tokens_read
+
+    started = time.perf_counter()
+    cut_short = False
+
+    for epoch in range(first_epoch, config.epochs):
         # Accumulated as a tensor on the device. Calling float() on the loss every step
         # would block on the MPS queue every step and turn the throughput number into a
         # measurement of the synchronisation instead of the training.
@@ -502,12 +559,49 @@ def train_embeddings_from_lines(
                     f"loss {float(loss.detach()):.4f} rate {rate:.5f}",
                     flush=True,
                 )
-        epoch_losses.append(float(epoch_loss_total) / epoch_steps if epoch_steps else float("nan"))
+            # Checked every _DEADLINE_CHECK_STEPS batches rather than every batch, so the
+            # clock read is not itself part of the inner loop's cost.
+            if (
+                deadline is not None
+                and step % _DEADLINE_CHECK_STEPS == 0
+                and time.monotonic() >= deadline
+            ):
+                cut_short = True
+                break
+        mean_loss = float(epoch_loss_total) / epoch_steps if epoch_steps else float("nan")
+        if cut_short:
+            # The partial epoch's loss is reported but kept out of epoch_losses, which stays
+            # one entry per *completed* epoch. Appending it would leave the list one longer
+            # than epochs_done, and a resume would then count that partial epoch again and
+            # report more epochs completed than were configured.
+            partial_epoch_loss = mean_loss
+        elif epoch_steps:
+            epoch_losses.append(mean_loss)
+        if checkpoint_directory is not None:
+            # An epoch cut short banks its progress under the previous epoch number, so a
+            # resume repeats that epoch rather than skipping the part it never did.
+            _checkpoint(
+                model,
+                vocabulary,
+                config,
+                stage,
+                epochs_done=epoch if cut_short else epoch + 1,
+                epoch_losses=epoch_losses,
+                tokens_read=feeder.tokens_read,
+                directory=Path(checkpoint_directory),
+            )
+        if cut_short:
+            break
 
     if device.type == "mps":
         torch.mps.synchronize()
     elapsed = time.perf_counter() - started
-    tokens_per_second = feeder.tokens_read / elapsed if elapsed > 0 else float("inf")
+    tokens_trained = feeder.tokens_read - (resume.tokens_read if resume else 0)
+    # A stage resumed from a checkpoint that was already finished trains nothing. Reporting
+    # 0 tokens/s for that reads like a failure, so it reports "not measured" instead.
+    tokens_per_second = (
+        tokens_trained / elapsed if tokens_trained > 0 and elapsed > 0 else float("nan")
+    )
 
     trained = TrainedEmbeddings(
         matrix=model.input_embeddings().to("cpu").numpy(),
@@ -515,10 +609,45 @@ def train_embeddings_from_lines(
         config=config,
         tokens_per_second=tokens_per_second,
         epoch_losses=tuple(epoch_losses),
+        epochs_completed=len(epoch_losses),
+        cut_short=cut_short,
+        tokens_trained=tokens_trained,
+        partial_epoch_loss=partial_epoch_loss,
     )
     if output_path is not None:
         trained.save(Path(output_path))
     return trained
+
+
+def _load_checkpoint_into(model: NegativeSamplingObjective, resume: Checkpoint) -> None:
+    """Restore both matrices from a checkpoint."""
+    with torch.no_grad():
+        model.input_matrix.weight.copy_(torch.as_tensor(resume.input_matrix))
+        model.output_matrix.weight.copy_(torch.as_tensor(resume.output_matrix))
+
+
+def _checkpoint(
+    model: NegativeSamplingObjective,
+    vocabulary: Vocabulary,
+    config: SGNSConfig,
+    stage: str,
+    epochs_done: int,
+    epoch_losses: list[float],
+    tokens_read: int,
+    directory: Path,
+) -> Path:
+    """Write both matrices and the position in the run."""
+    with torch.no_grad():
+        return Checkpoint(
+            stage=stage,
+            epochs_done=epochs_done,
+            input_matrix=model.input_matrix.weight.detach().to("cpu").numpy(),
+            output_matrix=model.output_matrix.weight.detach().to("cpu").numpy(),
+            vocabulary=vocabulary,
+            config_json=config_to_json(config),
+            epoch_losses=tuple(epoch_losses),
+            tokens_read=tokens_read,
+        ).save(directory)
 
 
 def _batch_loss(
