@@ -723,6 +723,14 @@ Early stopping watches RMSE because that is what the objective minimises, and th
 ranks on Spearman, so the two could have come apart. They did not. Both improve all the way
 up and both flatten together.
 
+**How short was 500 trees? Mildly, on error. Substantially, on rank.** Going from 500 to
+1,525 trees bought 0.0053 of validation RMSE, and all the way to 2,303 bought 0.0069, which
+is half a percent of a number sitting at 1.21. On that column the untuned rung was a little
+short and not badly wrong. Rank is the column that moved: test Spearman went 0.2635 to
+0.2799, up 6.2%, and that is half the distance to Ridge. Quoting only the RMSE figure would
+make the whole exercise look pointless, which is the same trap the Phase 2 headline warns
+about.
+
 **And Ridge still wins.** The four rows that matter, all scored on the same untouched test
 period:
 
@@ -746,6 +754,44 @@ So of the original 0.032 gap in rank correlation between rung 5 and rung 6, unde
 accounts for 0.0165, about half. The other half is real. **Trees are the wrong model for
 this matrix, and more of them will not fix it.** A hundred thousand mostly-zero TF-IDF
 columns is what a linear model is good at and what an axis-aligned split is bad at.
+
+#### The stopping rule has no minimum improvement, and it needs one
+
+`early_stopping_rounds=50` counts rounds since the best score. Any improvement resets the
+counter, however small, because the default `min_delta` is 0. On a curve that keeps
+creeping, that is barely a stopping rule at all.
+
+This curve crept. Over the last 800 rounds the mean improvement was **2.16e-06 of RMSE per
+round**, and 20 of the final 100 rounds still set a new best. So the run kept going long
+after the gains stopped mattering:
+
+| Rounds | Validation RMSE bought | Cost |
+|---|---|---|
+| 500 to 1,525 | 0.0053 | about 34 minutes |
+| 1,525 to 2,303 | 0.0017 | about 26 minutes |
+
+**It did stop, at 2,303 of a 5,000 ceiling, so the ceiling is not what ended this run.**
+But it was close, and the margin is luck rather than design: a slightly flatter curve would
+have carried it to 5,000 and the reported tree count would have been the ceiling wearing a
+measurement's clothes. Any future run must check which of the two ended it, which is why
+`tune_xgboost` says so in the note and refuses to call a ceiling-ended run a measurement.
+
+The fix is a threshold in the units of the metric. `xgboost.callback.EarlyStopping` takes
+`min_delta`, defaulting to 0. Replaying the recorded curve at other values:
+
+| `min_delta` | Would have stopped at | Rounds run |
+|---|---|---|
+| 0 (what ran) | 2,303 | 2,353 |
+| 1e-5 | 2,303 | 2,353 |
+| 5e-5 | 2,063 | 2,113 |
+| **1e-4** | **1,600** | 1,650 |
+| 5e-4 | 453 | 503 |
+
+`min_delta=1e-4` would have ended it at 1,600 trees and cost 0.0015 of validation RMSE,
+which is a third of the run for a fifth of a percent. That is the setting to use next time.
+Note what 5e-4 says too: at that threshold the answer would have been 453 trees, near the
+untuned 500, and the underfitting hypothesis would have looked refuted. The threshold is
+not a free parameter, it is part of the claim.
 
 #### What was not done, and what to do if anyone wants to push it
 

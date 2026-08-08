@@ -474,6 +474,14 @@ class EarlyStoppedXGBoost(AllSignalsXGBoost):
     what ends the run; if the run reaches it, the number measured is the ceiling and the
     result has to say so.
 
+    **``early_stopping_rounds`` has no minimum improvement and that is a known weakness
+    here.** XGBoost's default ``min_delta`` is 0, so an improvement of a few millionths
+    resets the counter. The Phase 2 run improved by a mean 2.16e-06 a round over its last
+    800 rounds and still went to 2,303 trees; replaying that curve, ``min_delta=1e-4``
+    stops at 1,600 for 0.0015 of RMSE. Left at 0 here because that is what was measured
+    and the run is quoted at that setting. Anything rerunning this should pass
+    ``xgboost.callback.EarlyStopping(rounds=..., min_delta=1e-4)`` instead and say so.
+
     The question it answers: 500 trees at depth 6 is at most 31,500 splits, against
     100,010 columns, so the untuned rung could not have looked at most of its own feature
     matrix. Either the run stops early, and 500 trees was already more than the model

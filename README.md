@@ -110,8 +110,21 @@ Off the one fitted model, scored on the test period at each tree count:
 |---|---|---|---|
 | 500 | 1.1530 | 0.8116 | 0.2635 |
 | 1,000 | 1.1509 | 0.8103 | 0.2715 |
+| 1,500 | 1.1499 | 0.8094 | 0.2759 |
 | 2,000 | 1.1492 | 0.8089 | 0.2787 |
 | 2,303 | 1.1490 | 0.8087 | 0.2799 |
+
+**500 trees was mildly short, not badly wrong.** Going from 500 to 2,303 bought 0.0069 of
+validation RMSE, half a percent of a number sitting at 1.21. The column that moved is rank:
+test Spearman 0.2635 to 0.2799, up 6.2%. Two thirds of that arrives by 1,500 trees and the
+last 800 trees are worth 0.004.
+
+**The stopping rule barely earned its keep.** `early_stopping_rounds=50` has no minimum
+improvement, so improvements of a few millionths keep resetting the counter, and over the
+last 800 rounds the mean improvement was 2.16e-06. It did stop at 2,303 rather than run to
+the 5,000 ceiling, but not by much. `min_delta=1e-4` would have ended it at 1,600 trees for
+0.0015 of RMSE, and that is the setting to use next time. Detail in
+[`docs/design.md`](docs/design.md#was-rung-6-underfitting).
 
 **Ridge still wins, and that is the answer.** Rank correlation 0.297 against 0.280, MAE
 0.802 against 0.809, RMSE tied at 1.149 to three decimals. Ridge fits in 157 seconds and

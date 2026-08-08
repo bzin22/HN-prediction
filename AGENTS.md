@@ -104,6 +104,13 @@ original gap and the other half is trees being wrong for a hundred thousand spar
 worth trying, and it was deliberately not tried: a baseline tuned until it wins is not a
 baseline. Reasoning in `docs/design.md`, "Was rung 6 underfitting?".
 
+**`early_stopping_rounds` alone is not a stopping rule; set `min_delta` with it.** Its
+default minimum improvement is 0, so an improvement of a few millionths resets the patience
+counter. Rung 6's curve improved by a mean 2.16e-06 an round over its last 800 rounds and
+still ran to 2,303 trees. It did stop before the 5,000 ceiling, but only just, and a run
+ended by its ceiling has measured the ceiling. Replaying that curve, `min_delta=1e-4` stops
+at 1,600 trees for 0.0015 of RMSE. Always report which of the two ended a run.
+
 **Anything passing an eval set to XGBoost must use `xgboost.train`, not `XGBRegressor`.**
 The wrapper builds eval sets as `QuantileDMatrix`, which has no incremental prediction
 cache, so every round re-scores the whole slice. Measured on the real matrix, same 296,531
