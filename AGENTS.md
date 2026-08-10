@@ -124,9 +124,9 @@ All four are encoded in `data/ingest.py`; the evidence is in `docs/design.md`.
    silently moves rows across month boundaries: it moved 226 rows out of the Phase 2
    training segment before the counts were checked against the known totals.
 
-## Word2vec: three things measured in Phase 3 that override earlier assumptions
+## Word2vec: what Phase 3 measured, which overrides earlier assumptions
 
-`docs/word2vec.md` is the full reasoning. These three are the ones that change what you write.
+`docs/word2vec.md` is the full reasoning. These are the ones that change what you write.
 
 1. **Train on CPU, not MPS.** Measured 105,142 against 24,383 pairs/s at 100k words by 300
    dimensions, so CPU is 4.3x faster. `select_device()` returns CPU on purpose, against the
@@ -134,11 +134,29 @@ All four are encoded in `data/ingest.py`; the evidence is in `docs/design.md`.
    because the steps are too small to pay for kernel launches. The Python feeder is not the
    bottleneck either (963,848 tokens/s). Re-measure before assuming this holds for a bigger
    model in a later phase.
-2. **`SGNSConfig.learning_rate` is per example, and the optimiser gets it times the batch
-   size.** The loss is a batch mean, so `0.025 * 1024 = 25.6` reaches the optimiser. The
-   number looks wrong and is not; see `optimiser_learning_rate`. The scaffold's 2.5e-3 was an
-   Adam-scale rate and was replaced with gensim's 0.025 falling to 0.0001.
-3. **The gensim comparison has two divergences, not one.** Its `sample` default is 1e-3
+2. **`learning_rate = 0.025` is measured, not inherited from gensim.** `make lr-sweep` ran
+   0.0025, 0.01, 0.025 and 0.05 on the same 5M-token text8 slice at three seeds each. 0.0025
+   crawls (ends at 5.52 where the others reach 3.9) and its vectors score nothing. **0.05
+   diverged on two of three seeds**, ending at 1.2e11 and 2.5e16. 0.025 is the largest rate
+   that converges smoothly and it also wins on both intrinsic scores.
+   `tests/test_learning_rate.py` pins it. Do not change it without rerunning the sweep.
+3. **Three seeds, because one lies.** On seed 0 alone, 0.05 does not blow up and posts the
+   best intrinsic scores, and 0.01 appears to beat 0.025 on WordSim-353. Both reverse over
+   three seeds. Any comparison of these intrinsic scores has to clear a noise band: the
+   Spearman sampling error is `1 / sqrt(n - 3)`, which is 0.055 at the 336 pairs covered, and
+   the measured seed spread was larger still at 0.114.
+4. **The optimiser gets `learning_rate * batch_size`, and that is now measured too.** The loss
+   is a batch mean, so `0.025 * 1024 = 25.6` reaches the optimiser. `make batch-scaling` ran
+   batch 1, 32 and 1024 over identical examples: 4.8183, 4.9987, 5.4211, against **11.0790 for
+   batch 1024 with the multiplication removed**, which is the untrained starting loss. So the
+   multiplication is the difference between learning and not learning. The residual +12.5% at
+   batch 1024 is within-batch staleness, grows with the batch, and is reported not gated.
+5. **CBOW needs more corpus than Skip-gram for the same convergence.** With a window of 5 it
+   produces one training example per position against Skip-gram's ten, so 3.8x fewer optimiser
+   steps on the same text. Any corpus sized on Skip-gram's numbers has to be checked against
+   CBOW: the dry-run corpus was not, and CBOW failed its own gate at 0.392 purity the first
+   time both objectives ran. `chain.DRY_RUN_CORPUS` is sized for CBOW now.
+6. **The gensim comparison has two divergences, not one.** Its `sample` default is 1e-3
    against our 1e-5 and must be passed explicitly, and its subsampling formula is
    `sqrt(t/f) + t/f` where the paper's is `sqrt(t/f)`, which cannot be passed away. Both are
    in `evaluate.train_gensim`.
@@ -153,48 +171,20 @@ compare against. Gate on task scores instead, task supplied by the caller.
 `skipgram.py` must contain nothing but `forward`. A test enforces that, because a duplicated
 sampler is how the CBOW-against-Skip-gram comparison stops meaning anything.
 
-The overnight chain is `embeddings/chain.py`, four stages, `make chain-dry-run` proves all four
-on synthetic corpora in about 7 seconds. Checkpoints carry **both** matrices, since resuming
-from the embedding alone restarts scoring from zero. A cut-short epoch banks under the previous
-epoch number and keeps its loss out of the per-epoch list, or a resume double-counts it.
+The overnight chain is `embeddings/chain.py`. **Both objectives by default, four stages each,
+six variants**, and `make chain-dry-run` proves all eight on synthetic corpora in about 20 seconds.
+Artefacts are `{objective}-{stage}.npz` and checkpoints `{objective}-{stage}-epoch{n}.npz`, so
+a resume cannot cross objectives and a variant on disk cannot lie about what made it. The two
+objectives share the Wikipedia subset, sized from Skip-gram's throughput because it is the
+slower one; sizing each to its own ceiling would make the comparison about corpus size.
+Checkpoints carry **both** matrices, since resuming from the embedding alone restarts scoring
+from zero. A cut-short epoch banks under the previous epoch number and keeps its loss out of
+the per-epoch list, or a resume double-counts it.
 
-Embedding tests need the `train` extra, which the base install and the main CI job do not
-carry, so they `importorskip`. The separate `embeddings` CI job installs the CPU torch wheel and
-runs them; without that job they would never run anywhere.
-
-## Word2vec: three things measured in Phase 3 that override earlier assumptions
-
-`docs/word2vec.md` is the full reasoning. These three are the ones that change what you write.
-
-1. **Train on CPU, not MPS.** Measured 105,142 against 24,383 pairs/s at 100k words by 300
-   dimensions, so CPU is 4.3x faster. `select_device()` returns CPU on purpose, against the
-   scaffold's original assumption. Sparse gradients do work on MPS; MPS is just slower,
-   because the steps are too small to pay for kernel launches. The Python feeder is not the
-   bottleneck either (963,848 tokens/s). Re-measure before assuming this holds for a bigger
-   model in a later phase.
-2. **`SGNSConfig.learning_rate` is per example, and the optimiser gets it times the batch
-   size.** The loss is a batch mean, so `0.025 * 1024 = 25.6` reaches the optimiser. The
-   number looks wrong and is not; see `optimiser_learning_rate`. The scaffold's 2.5e-3 was an
-   Adam-scale rate and was replaced with gensim's 0.025 falling to 0.0001.
-3. **The gensim comparison has two divergences, not one.** Its `sample` default is 1e-3
-   against our 1e-5 and must be passed explicitly, and its subsampling formula is
-   `sqrt(t/f) + t/f` where the paper's is `sqrt(t/f)`, which cannot be passed away. Both are
-   in `evaluate.train_gensim`.
-
-Two gate metrics were tried and rejected; do not reinvent them. Rank correlation between our
-word-pair similarities and gensim's scores 0.012 for a *correct* implementation, because most
-random pairs have no defined answer. And the planted-synonym corpus cannot gate anything:
-gensim recovers 0 of 6 pairs on it while this implementation recovers 6, so it is too small to
-compare against. Gate on task scores instead, task supplied by the caller.
-
-`embeddings/negative_sampling.py` owns both matrices, the sampler and the loss; `cbow.py` and
-`skipgram.py` must contain nothing but `forward`. A test enforces that, because a duplicated
-sampler is how the CBOW-against-Skip-gram comparison stops meaning anything.
-
-The overnight chain is `embeddings/chain.py`, four stages, `make chain-dry-run` proves all four
-on synthetic corpora in about 7 seconds. Checkpoints carry **both** matrices, since resuming
-from the embedding alone restarts scoring from zero. A cut-short epoch banks under the previous
-epoch number and keeps its loss out of the per-epoch list, or a resume double-counts it.
+A night is **7.5 hours expected against 11.0 hours of ceilings**; `chain.overnight_budget` is
+the arithmetic and `make hn-token-count` is where its 75,283,676-token input comes from. Two
+costs sit outside it and are not measured: gensim's half of each gate, and the Hacker News
+reader's real throughput. If it stops fitting, cut epochs on the HN stages, not an objective.
 
 Embedding tests need the `train` extra, which the base install and the main CI job do not
 carry, so they `importorskip`. The separate `embeddings` CI job installs the CPU torch wheel and

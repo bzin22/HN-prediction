@@ -58,4 +58,6 @@ jobs:
           pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev,train]"
 
       - name: Test the embeddings
-        run: pytest -v tests/test_embeddings_sgns.py tests/test_embeddings_chain.py
+        run: |
+          pytest -v tests/test_embeddings_sgns.py tests/test_embeddings_chain.py \
+            tests/test_learning_rate.py

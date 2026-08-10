@@ -33,6 +33,14 @@ from hn_upvotes.data.preprocess import normalise_title, stream_corpus, tokenise
 #: 2026-08-06, 4,739,207 stories of which 352,771 (7.4%) carry body text.
 HN_CORPUS_PATH = Path.home() / ".cache" / "hn-prediction" / "stories.parquet"
 
+#: The Hacker News corpus in tokens, titles and bodies, **counted rather than estimated** with
+#: ``make hn-token-count`` on 2026-08-07: 75,283,676 tokens over 5,091,739 lines, 14.8 tokens a
+#: line. Re-count after an ingest, since the archive grows.
+#:
+#: The bodies are most of it. 4,739,207 titles at about 8 tokens is 38M, so the 352,532 lines
+#: of body text carry the other half of the corpus on 7% of the rows.
+HN_CORPUS_TOKENS = 75_283_676
+
 #: text8's canonical home. 31 MB zipped, 100 MB unpacked, 17.0M tokens.
 TEXT8_URL = "http://mattmahoney.net/dc/text8.zip"
 
@@ -54,8 +62,8 @@ def stream_text8(path: Path) -> Iterator[list[str]]:
 def download_text8(destination: Path) -> Path:
     """Fetch and unpack text8 if it is not already there, and return the text file path.
 
-    **Not run yet.** The build-only brief forbids downloading a corpus, so this is code the
-    first real gate run will exercise, not code that has been exercised.
+    **Run, and it works.** The learning-rate sweep needed text8, so this path is exercised:
+    31 MB zipped from ``mattmahoney.net``, 100,000,000 bytes and 17,005,207 tokens unpacked.
     """
     destination = Path(destination)
     text_path = destination / "text8"
@@ -69,6 +77,27 @@ def download_text8(destination: Path) -> Path:
     with zipfile.ZipFile(archive) as bundle:
         bundle.extractall(destination)
     return text_path
+
+
+def take_tokens(lines: Iterator[list[str]], token_budget: int | None) -> Iterator[list[str]]:
+    """Stop a corpus stream after ``token_budget`` tokens, cutting the last line short.
+
+    text8 is one 100 MB line, so the budget cannot be applied by counting lines. This wraps
+    any stream of token lists, which is what the learning-rate sweep needs to give four
+    training runs the identical corpus without holding it in memory.
+    """
+    if token_budget is None:
+        yield from lines
+        return
+    taken = 0
+    for tokens in lines:
+        if taken + len(tokens) > token_budget:
+            remaining = token_budget - taken
+            if remaining > 0:
+                yield tokens[:remaining]
+            return
+        taken += len(tokens)
+        yield tokens
 
 
 def stream_plain_text(path: Path, token_budget: int | None = None) -> Iterator[list[str]]:
@@ -101,9 +130,13 @@ def prepare_wikipedia_subset(destination: Path, token_budget: int) -> Path:
     the ``text`` column crosses the network.
 
     **Not run yet, and this is the one part of the chain that has not been proved.**
-    Exercising it means downloading a corpus, which the build-only brief rules out. The
-    chain's Wikipedia stage will fail here first if the query or the dataset path is wrong,
-    and that failure is contained: stage 3 still produces the ``hn-only`` variant.
+    Exercising it means downloading 1.13 GB, which the build-only brief rules out. The chain's
+    Wikipedia stage will fail here first if the query or the dataset path is wrong, and that
+    failure is contained: stage 3 still produces the ``hn-only`` variant, and the other
+    objective is untouched.
+
+    Written once and read by both objectives, so the CBOW against Skip-gram comparison is not
+    confounded by corpus size. The chain skips this call when the file is already there.
     """
     import duckdb
 
@@ -169,6 +202,24 @@ def stream_hn_text(
                     return
                 taken += len(tokens)
                 yield tokens
+
+
+def count_hn_tokens(
+    parquet_path: Path = HN_CORPUS_PATH, include_bodies: bool = True
+) -> tuple[int, int]:
+    """Tokens and lines in the Hacker News corpus, counted rather than estimated.
+
+    The overnight budget rests on this number, and "about eight tokens a title times five
+    million titles" is a guess with a body-text term missing from it. Counting takes a couple
+    of minutes and turns the budget into arithmetic. See
+    :func:`~hn_upvotes.embeddings.chain.overnight_budget`.
+    """
+    tokens = 0
+    lines = 0
+    for line in stream_hn_text(parquet_path, include_bodies=include_bodies):
+        tokens += len(line)
+        lines += 1
+    return tokens, lines
 
 
 #: The synonym groups the planted corpus is built from. Each group gets two members that
@@ -243,3 +294,22 @@ def topic_corpus(
     rng.shuffle(lines)
     topic_of = {word: topic for topic, words in enumerate(words_by_topic) for word in words}
     return lines, topic_of
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Count the Hacker News corpus and print the number the overnight budget needs."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description=count_hn_tokens.__doc__.splitlines()[0])
+    parser.add_argument("--hn-corpus", type=Path, default=HN_CORPUS_PATH)
+    parser.add_argument("--titles-only", action="store_true", help="exclude body text")
+    args = parser.parse_args(argv)
+
+    tokens, lines = count_hn_tokens(args.hn_corpus, include_bodies=not args.titles_only)
+    print(f"{tokens:,} tokens over {lines:,} lines in {args.hn_corpus}")
+    print(f"{tokens / max(lines, 1):.1f} tokens per line")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

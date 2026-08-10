@@ -162,6 +162,11 @@ class TrainedEmbeddings:
     ``cut_short`` is true when a wall-clock budget stopped the run before it finished its
     epochs. The matrix is still usable and is still worth keeping; it just did not get the
     training it was configured for, and nothing downstream should read it as if it did.
+
+    ``loss_trace`` is the mean loss over each block of ``loss_trace_every`` batches, empty
+    unless that argument was passed. One number per epoch cannot tell a rate that converges
+    from a rate that diverges half way through and recovers its average, which is why the
+    learning-rate sweep asks for this instead.
     """
 
     matrix: np.ndarray
@@ -173,6 +178,7 @@ class TrainedEmbeddings:
     cut_short: bool = False
     tokens_trained: int = 0
     partial_epoch_loss: float = float("nan")
+    loss_trace: tuple[float, ...] = ()
 
     def save(self, path: Path) -> None:
         """Write matrix and vocabulary together, so they cannot drift apart."""
@@ -191,6 +197,7 @@ class TrainedEmbeddings:
             cut_short=np.asarray(self.cut_short),
             tokens_trained=np.asarray(self.tokens_trained),
             partial_epoch_loss=np.asarray(self.partial_epoch_loss),
+            loss_trace=np.asarray(self.loss_trace, dtype=np.float64),
         )
 
     @classmethod
@@ -214,6 +221,12 @@ class TrainedEmbeddings:
                 cut_short=bool(payload["cut_short"]),
                 tokens_trained=int(payload["tokens_trained"]),
                 partial_epoch_loss=float(payload["partial_epoch_loss"]),
+                # Absent from artefacts written before the loss trace existed.
+                loss_trace=(
+                    tuple(float(x) for x in payload["loss_trace"])
+                    if "loss_trace" in payload.files
+                    else ()
+                ),
             )
 
 
@@ -484,6 +497,7 @@ def train_embeddings_from_lines(
     stage: str = "train",
     resume: Checkpoint | None = None,
     deadline: float | None = None,
+    loss_trace_every: int = 0,
 ) -> TrainedEmbeddings:
     """The training loop, over a callable that reopens the corpus for each epoch.
 
@@ -505,6 +519,10 @@ def train_embeddings_from_lines(
         A ``time.monotonic()`` value. When it passes the loop stops between batches, saves
         what it has, and returns with ``cut_short=True`` set on the artefact. It does not
         pretend the run finished.
+
+    ``loss_trace_every`` records the mean loss over each block of that many batches, which is
+    the within-epoch loss curve the learning-rate sweep compares. It costs one device
+    synchronisation per block, so leave it at 0 in a real run.
     """
     device = torch.device(config.device) if config.device else select_device()
     model = build_objective(config, len(vocabulary)).to_device(device)
@@ -522,6 +540,9 @@ def train_embeddings_from_lines(
     feeder = BatchFeeder(config, keep_probabilities, seed=config.seed)
     step = 0
     epoch_losses: list[float] = []
+    loss_trace: list[float] = []
+    block_loss_total = torch.zeros((), device=device)
+    block_steps = 0
     partial_epoch_loss = float("nan")
     first_epoch = 0
 
@@ -553,6 +574,13 @@ def train_embeddings_from_lines(
             step += 1
             epoch_loss_total += loss.detach()
             epoch_steps += 1
+            if loss_trace_every:
+                block_loss_total += loss.detach()
+                block_steps += 1
+                if block_steps == loss_trace_every:
+                    loss_trace.append(float(block_loss_total) / block_steps)
+                    block_loss_total = torch.zeros((), device=device)
+                    block_steps = 0
             if progress_every and step % progress_every == 0:
                 print(
                     f"epoch {epoch + 1}/{config.epochs} step {step} "
@@ -593,6 +621,11 @@ def train_embeddings_from_lines(
         if cut_short:
             break
 
+    if block_steps:
+        # The tail block is shorter than the rest. Keeping it means the curve reaches the end
+        # of the run, which is the half a diverging rate shows up in.
+        loss_trace.append(float(block_loss_total) / block_steps)
+
     if device.type == "mps":
         torch.mps.synchronize()
     elapsed = time.perf_counter() - started
@@ -613,6 +646,7 @@ def train_embeddings_from_lines(
         cut_short=cut_short,
         tokens_trained=tokens_trained,
         partial_epoch_loss=partial_epoch_loss,
+        loss_trace=tuple(loss_trace),
     )
     if output_path is not None:
         trained.save(Path(output_path))

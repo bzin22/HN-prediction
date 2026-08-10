@@ -9,9 +9,11 @@ objective, with negative sampling. Three fusion architectures combine the title 
 with the other signals. Validation is a single cut on the time axis: train on 2006 to
 2022, test on 2024 and 2025.
 
-**Status: Phase 2 done.** Six baseline models are measured on that split and the numbers
-are below. No neural network has been trained yet. The reasoning behind every design
-choice, with the plots, is in [`docs/design.md`](docs/design.md).
+**Status: Phase 2 done, Phase 3 implemented and tuned.** Six baseline models are measured
+on that split and the numbers are below. Both word2vec objectives are written and their two
+hyperparameter claims are settled on text8, but no embedding variant has been trained yet.
+The reasoning behind every design choice, with the plots, is in
+[`docs/design.md`](docs/design.md).
 
 ## The data
 
@@ -100,7 +102,7 @@ rung 3 on the 13.8% whose host has none. `make baselines` reproduces all of it i
 | 0 | Repo, README, scaffold, CI | Done |
 | 1 | Ingest and EDA, three gates, leak audit | Done |
 | 2 | Time split, six baseline rungs, the metrics that report them | Done |
-| 3 | CBOW and Skip-gram on text8, validated against gensim, then the Wikipedia subset | Implemented, not yet trained |
+| 3 | CBOW and Skip-gram on text8, validated against gensim, then the Wikipedia subset | Implemented and tuned, no variant trained yet |
 | 4 | HN fine-tuning, three-variant comparison | Not started |
 | 5 | Early, late and hybrid fusion, plus ablations | Not started |
 | 6 | FastAPI and Docker | Not started |
@@ -109,9 +111,10 @@ rung 3 on the 13.8% whose host has none. `make baselines` reproduces all of it i
 ## Phase 3: the implementation, before any training
 
 CBOW and Skip-gram are implemented from scratch and the overnight training chain is wired
-up. **Nothing has been trained on a real corpus yet**, by design: the algorithms get
-reviewed before an epoch is spent. Every number below is from a synthetic corpus or a
-microbenchmark. The reasoning is in [`docs/word2vec.md`](docs/word2vec.md).
+up for both. **No embedding variant has been produced yet**, by design: the algorithms get
+reviewed before a night is spent. text8 has been trained on for two hyperparameter
+measurements and nothing else, at 5M and 120k tokens. The reasoning is in
+[`docs/word2vec.md`](docs/word2vec.md).
 
 Two measurements decided the shape of it, both from `make throughput`.
 
@@ -139,16 +142,69 @@ two-hour ceiling over 5 epochs: `138,362 x 0.96 x 7,200 / 5 = 191,271,628` token
 
 ```bash
 make throughput      # the two measurements above
-make chain-dry-run   # all four overnight stages on synthetic corpora, about 7 seconds
+make lr-sweep        # four learning rates on text8, three seeds each, about 25 minutes
+make batch-scaling   # the batch-size rate multiplication against a batch-1 run, minutes
+make chain-dry-run   # both objectives, every stage, synthetic corpora, about 20 seconds
 make chain           # the real overnight run, detached
 ```
 
-The chain runs a gate first: train on text8, train gensim on the same corpus with the same
-settings, compare on the intrinsic evaluations, and **abort the whole night if our vectors
-are meaningfully worse**. Then the three variants the project compares, with `hn-only` last
-so a Wikipedia failure costs one variant instead of the night. It checkpoints every epoch,
-resumes from the newest checkpoint, holds a wall-clock budget per stage, and writes one
-JSON manifest so a night is readable from one file.
+### Two hyperparameter claims, now measured on text8
+
+**The learning rate is 0.025, and that is the sweep's answer rather than gensim's.** Four
+rates over an identical 5,000,000-token slice of text8, three seeds each, one epoch,
+dimension 300:
+
+| Rate | Blew up | Final loss | Worst lurch, as a share of the fall | WordSim-353 | Analogy |
+|---|---:|---:|---:|---:|---:|
+| 0.0025 | 0 of 3 | 5.5199 | 3.1% | -0.015 | 0.00003 |
+| 0.01 | 0 of 3 | 3.9568 | 3.0% | 0.031 | 0.00000 |
+| **0.025** | **0 of 3** | **3.8915** | **5.8%** | **0.079** | **0.00028** |
+| 0.05 | **2 of 3** | 4.1501 | 24.9% | 0.089 | 0.00064 |
+
+The rule is the largest rate that still converges smoothly. 0.0025 crawls: it ends at a loss
+the others pass in the first 5% of the run, and its vectors score nothing on all three seeds.
+0.05 destabilises, and more than predicted: it ran away to 1.2e11 on one seed and 2.5e16 on
+another, both inside the first tenth of the epoch. Its loss columns above are the one seed
+that survived, and even that one lurches by 1.50 in a single block, 24.9% of its total fall
+against 5.8% for 0.025. So 0.025 it is, unchanged.
+
+**Three seeds, because one lies.** On seed 0 alone, 0.05 does not blow up and posts the best
+score in both intrinsic columns, and 0.01 appears to beat 0.025 on WordSim-353. Both reverse
+over three seeds. Every comparison now has to clear a noise band: the sampling error on a
+Spearman correlation over the 336 pairs covered is 0.055, and the measured spread across seeds
+was 0.114.
+
+**The batch-size multiplication is what makes a large batch train at all.** The optimiser
+gets `learning_rate * batch_size`, which is `0.025 * 1024 = 25.6` and looks wrong. Four arms
+over the same 83,331 training examples, batch size the only difference:
+
+| Arm | Optimiser rate | Final loss | Against batch 1 |
+|---|---:|---:|---:|
+| batch 1 | 0.025 | 4.8183 | |
+| batch 32 | 0.8 | 4.9987 | +3.7% |
+| batch 1024 | 25.6 | 5.4211 | +12.5% |
+| batch 1024, multiplication removed | 0.025 | 11.0790 | +129.9% |
+
+Delete the multiplication and the batch does not move: 11.0790 is the loss a zero output
+matrix forces before any training. Keep it and nothing diverges. The residual +12.5% is a cost
+of batching that no rate can undo, because updates inside a batch do not see each other, and
+it grows with the batch as that explanation predicts.
+
+### The chain runs both objectives
+
+One invocation, Skip-gram then CBOW, four stages each, **six variants**. A gate runs first for
+each objective: train on text8, train gensim on the same corpus with the same settings and the
+matching `sg` flag, compare, and **abort that objective if our vectors are meaningfully
+worse**. Then the three variants, with `hn-only` last so a Wikipedia failure costs one variant
+instead of the night. Artefacts are `{objective}-{stage}.npz`, a CBOW failure cannot cost the
+Skip-gram variants, and a resume does not restart an objective that already finished.
+
+**A night is 7.5 hours expected against 11.0 hours of ceilings**, so it fits. CBOW is the cheap
+half at 2.3 hours against Skip-gram's 5.2, because it is 2.2x faster per corpus token. The HN
+corpus is counted rather than guessed: 75,283,676 tokens over 5,091,739 lines. If it stops
+fitting, the lever is epochs on the HN stages, not an objective. See
+[`docs/word2vec.md`](docs/word2vec.md) for the stage-by-stage table and the three costs that
+sit outside it.
 
 ## Getting started
 
@@ -187,7 +243,9 @@ Code is `src/hn_upvotes/`, split into `data/`, `embeddings/`, `features/`, `targ
 [`embeddings/train.py`](src/hn_upvotes/embeddings/train.py),
 [`embeddings/corpora.py`](src/hn_upvotes/embeddings/corpora.py),
 [`embeddings/checkpoint.py`](src/hn_upvotes/embeddings/checkpoint.py),
-[`embeddings/throughput.py`](src/hn_upvotes/embeddings/throughput.py) and
+[`embeddings/throughput.py`](src/hn_upvotes/embeddings/throughput.py),
+[`embeddings/learning_rate_sweep.py`](src/hn_upvotes/embeddings/learning_rate_sweep.py),
+[`embeddings/batch_scaling.py`](src/hn_upvotes/embeddings/batch_scaling.py) and
 [`embeddings/chain.py`](src/hn_upvotes/embeddings/chain.py). Everything else is a stub
 carrying its real type-annotated signature and a docstring saying what it will do.
 
