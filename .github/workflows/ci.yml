@@ -38,10 +38,10 @@ jobs:
       - name: Test
         run: pytest -v
 
-  # The word2vec tests need torch and gensim, which the base install deliberately does not
-  # carry. They skip entirely under `check`, so without this job they would never run in CI.
-  # Split into its own job so the fast checks are not held up behind a torch download.
-  embeddings:
+  # These tests need the train extra, which the base install deliberately does not carry.
+  # They skip entirely under `check`, so without this job they would never run in CI. Split
+  # into its own job so the fast checks are not held up behind a torch download.
+  train-extra:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,9 @@ jobs:
         run: |
           pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev,train]"
 
-      - name: Test the embeddings
+      # xgboost's Linux wheel bundles its own OpenMP runtime, so the early stopping tests
+      # run here without the libomp workaround `make tune-xgboost` needs on macOS.
+      - name: Test the embeddings and the early stopped rung
         run: |
           pytest -v tests/test_embeddings_sgns.py tests/test_embeddings_chain.py \
-            tests/test_learning_rate.py
+            tests/test_learning_rate.py tests/test_early_stopped_xgboost.py

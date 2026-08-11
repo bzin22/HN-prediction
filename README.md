@@ -58,19 +58,21 @@ One time-based split: 3,568,252 training rows from 2006-10 to 2022-11 and 599,93
 rows from 2024-01 to 2025-12. The 571,018 rows between and after them are dropped because
 the archive recorded those scores at submission, before anyone had voted.
 
-Six baselines, all predicting `log1p(score)`. Spearman is rank correlation: it compares
-two orderings and ignores the actual numbers, 1 if they order posts identically and 0 if
-there is no relationship. Precision@100 is in
+Six baselines, all predicting `log1p(score)`, plus rung 6 re-run with early stopping as 6b.
+Rung 6b is fitted on 296,531 fewer rows, because those are the validation tail it stops on.
+Spearman is rank correlation: it compares two orderings and ignores the actual numbers, 1 if
+they order posts identically and 0 if there is no relationship. Precision@100 is in
 [`docs/design.md`](docs/design.md#the-reporting-format) with the full table.
 
-| Rung | Sees | RMSE | MAE | Spearman |
-|---|---|---|---|---|
-| 1. Trailing mean | nothing | 1.191 | 0.854 | 0.050 |
-| 2. Author history | the account | 1.210 | 0.844 | 0.176 |
-| 3. Domain history | the linked host | 1.220 | 0.852 | 0.154 |
-| 4. Body text + Ridge | the body text | 1.197 | 0.808 | 0.040 |
-| 5. All signals + Ridge | everything | **1.149** | **0.802** | **0.297** |
-| 6. All signals + XGBoost | everything | 1.152 | 0.814 | 0.265 |
+| Rung | Sees | Trees | RMSE | MAE | Spearman |
+|---|---|---|---|---|---|
+| 1. Trailing mean | nothing | | 1.191 | 0.854 | 0.050 |
+| 2. Author history | the account | | 1.210 | 0.844 | 0.176 |
+| 3. Domain history | the linked host | | 1.220 | 0.852 | 0.154 |
+| 4. Body text + Ridge | the body text | | 1.197 | 0.808 | 0.040 |
+| 5. All signals + Ridge | everything | | **1.149** | **0.802** | **0.297** |
+| 6. All signals + XGBoost, 500 trees | everything | 500 | 1.152 | 0.814 | 0.265 |
+| 6b. The same, early stopped | everything | 2,303 | 1.149 | 0.809 | 0.280 |
 
 **The models learn order, not magnitude. That is the Phase 2 result.** Rung 1 to rung 5
 spreads Spearman sixfold, 0.050 to 0.297, while RMSE moves 3.6%. The floor explains the
@@ -79,7 +81,8 @@ and there is little absolute error left to win. Ordering is the question the fea
 answer.
 
 **All signals into Ridge is the strongest rung** and the bar Phase 5 has to clear. It wins
-on all three columns.
+on all three columns, though rung 6b ties it on RMSE at three decimals and only loses at
+four, 1.1485 against 1.1490.
 
 **Body text alone is close to the floor.** Rung 4 has the best MAE of the single-signal
 rungs, 0.808, on a Spearman of 0.040, below rung 1's 0.050: it lowers typical error and
@@ -88,12 +91,56 @@ the evidence, a link post with a long body comment, is 0.9% of training rows aga
 of test rows. The habit barely existed while the model was learning. Phase 3 should not
 count on the body as a second corpus without re-checking on recent data alone.
 
-**Gradient boosting does not beat the linear model.** Rung 6 takes the identical matrix
-and is worse on all three columns, for 25 minutes of fitting against 3.
+**Gradient boosting does not beat the linear model, and it was underfitting.** Both are
+true. Rung 6 at 500 trees is worse than Ridge on all three columns for 25 minutes of
+fitting against 3. It was also starved: 500 trees at depth 6 is at most 31,500 splits
+against 100,010 features.
+
+Re-running it with early stopping settles it. The stopping point is chosen on the last
+twelve months of the training period, 2021-12 to 2022-11, cut off the end and never
+trained on: 296,531 rows held back, 3,271,721 left to fit on. A time cut, not a random
+sample, or the tree count would be picked using posts from the same weeks the model
+trained on. The test period is untouched and scored once. It stopped at
+**2,303 trees, 4.6 times the 500**, and it stopped early rather than reaching the 5,000
+ceiling, so that is a measurement and not a limit. Every metric improved the whole way up.
+Off the one fitted model, scored on the test period at each tree count:
+
+| Trees | RMSE | MAE | Spearman |
+|---|---|---|---|
+| 500 | 1.1530 | 0.8116 | 0.2635 |
+| 1,000 | 1.1509 | 0.8103 | 0.2715 |
+| 1,500 | 1.1499 | 0.8094 | 0.2759 |
+| 2,000 | 1.1492 | 0.8089 | 0.2787 |
+| 2,303 | 1.1490 | 0.8087 | 0.2799 |
+
+**500 trees was mildly short, not badly wrong.** Going from 500 to 2,303 bought 0.0069 of
+validation RMSE, half a percent of a number sitting at 1.21. The column that moved is rank:
+test Spearman 0.2635 to 0.2799, up 6.2%. Two thirds of that arrives by 1,500 trees and the
+last 800 trees are worth 0.004.
+
+**The stopping rule barely earned its keep.** `early_stopping_rounds=50` has no minimum
+improvement, so improvements of a few millionths keep resetting the counter, and over the
+last 800 rounds the mean improvement was 2.16e-06. It did stop at 2,303 rather than run to
+the 5,000 ceiling, but not by much. `min_delta=1e-4` would have ended it at 1,600 trees for
+0.0015 of RMSE, and that is the setting to use next time. Detail in
+[`docs/design.md`](docs/design.md#was-rung-6-underfitting).
+
+**Ridge still wins, and that is the answer.** Rank correlation 0.297 against 0.280, MAE
+0.802 against 0.809, RMSE tied at 1.149 to three decimals. Ridge fits in 157 seconds and
+the early-stopped rung takes 4,817, so gradient boosting costs 31 times as much to lose.
+The comparison is not flattered by the held-back year either: Ridge fitted on the same
+reduced rows scores 0.289, still ahead of 0.280.
+
+So underfitting was real and it explains about half the original gap, 0.0165 of 0.032 in
+rank correlation. The other half is not a tuning problem. Ranking gains were down to
++0.004 over the last 800 trees when it stopped, so more trees will not close it. **No
+further tuning was done.** A baseline that gets tuned until it wins has stopped being a
+baseline. `docs/design.md` has the reasoning and the recommendation.
 
 Rung 2 falls back to rung 1 on the 10.0% of test rows whose author has no earlier post,
-rung 3 on the 13.8% whose host has none. `make baselines` reproduces all of it into
-`artifacts/baselines.json`, which carries all four metrics.
+rung 3 on the 13.8% whose host has none. `make baselines` reproduces rungs 1 to 6 into
+`artifacts/baselines.json` and `make tune-xgboost` reproduces the early-stopped run into
+`artifacts/xgboost-early-stopping.json`, both with all four metrics.
 
 ## Phases
 
@@ -216,7 +263,8 @@ make check
 ```
 
 Heavy dependencies are optional extras, installed with `pip install -e ".[data]"` and so
-on for `train` and `serve`. `make baselines` needs both. Rung 6 uses XGBoost, a separate
+on for `train` and `serve`. `make baselines` and `make tune-xgboost` need both. Rung 6
+uses XGBoost, a separate
 package with a scikit-learn compatible estimator that is not part of scikit-learn. It
 needs an OpenMP runtime, which macOS does not ship, so `make baselines` points at the copy
 scikit-learn's own wheel already carries. `brew install libomp` is the alternative.

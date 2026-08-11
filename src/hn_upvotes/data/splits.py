@@ -12,6 +12,10 @@ written here: it is read from ``ingest.UNSETTLED_SCORE_MONTHS`` through
 
 The boundaries are :class:`SplitConfig`, not literals in code, so moving the cut is a
 config change and shows up as one in a diff.
+
+A model that has to stop on a held-out number gets a third slice, the validation tail:
+the last months of the training period, cut off by :func:`cut_validation_tail`. It is a
+cut on the same time axis for the same reason. The test period is never involved.
 """
 
 from __future__ import annotations
@@ -46,6 +50,33 @@ class SplitConfig:
 
 #: The Phase 2 split. Import this rather than constructing a config at a call site.
 DEFAULT_SPLIT = SplitConfig()
+
+#: First month of the validation tail held back from the training split, for anything that
+#: has to stop on a held-out number: XGBoost's early stopping is the first such thing.
+#:
+#: 2021-12 to 2022-11 inclusive, the last twelve months of the training period. A full year
+#: rather than a shorter tail because a shorter one is a season, and a model picked on
+#: three winter months is picked on winter. Measured against ``data/stories.parquet`` on
+#: 2026-08-07: 296,531 validation rows, 8.3% of the training split, leaving 3,271,721 rows
+#: to fit on.
+#:
+#: **This is a cut on the time axis and it cannot be anything else.** A random validation
+#: split would let a model choose its stopping point using posts from the same weeks it
+#: trained on, which is the leak this project is built to avoid.
+DEFAULT_VALIDATION_START = "2021-12"
+
+#: How many of those rows are actually scored each round. All 296,531 are held out of
+#: training either way; this only bounds the slice that gets evaluated, because anything
+#: evaluated once per boosting round is paid for thousands of times.
+#:
+#: Sampled across the whole twelve months rather than taken as the last 50,000 rows, which
+#: would be about two months and would pick a stopping point on one season. Seeded, so the
+#: slice is the same on a rerun.
+#:
+#: **Sampling does not weaken strictly-earlier.** Every row at or after the boundary stays
+#: out of the fit set whether it is scored or not, so every scored row is still later than
+#: every row the model learned from.
+DEFAULT_VALIDATION_SAMPLE_ROWS = 50_000
 
 
 @dataclass(frozen=True)
@@ -122,6 +153,77 @@ def assert_no_temporal_overlap(split: TemporalSplit) -> None:
             f"train ends at {split.train_end}, after test starts at {split.test_start}. "
             "A test row earlier than a training row makes the whole result meaningless."
         )
+
+
+def validation_tail_mask(
+    times: pd.Series,
+    first_validation_month: str = DEFAULT_VALIDATION_START,
+) -> np.ndarray:
+    """Which rows fall in the validation tail, as a positional boolean mask.
+
+    A mask rather than two frames because the caller usually has to cut a target array
+    the same way, and a mask cuts both without either one drifting from the other.
+
+    Every false row is strictly earlier than every true row, because the test is a single
+    ``>=`` against one month boundary. That is the property the whole thing rests on.
+    """
+    boundary = _month_start(first_validation_month)
+    stamps = pd.to_datetime(pd.Series(times).reset_index(drop=True))
+    return (stamps >= boundary).to_numpy()
+
+
+def sample_validation_tail(
+    in_tail: np.ndarray,
+    sample_rows: int | None = DEFAULT_VALIDATION_SAMPLE_ROWS,
+    seed: int = 0,
+) -> np.ndarray:
+    """Thin the validation tail down to at most ``sample_rows`` rows, keeping the mask.
+
+    Takes the tail mask and returns a subset of it, so the result can only ever be rows
+    that were already held out of training. Sampling cannot pull a row back across the
+    boundary, because it never adds a row.
+
+    A bounded slice because it is scored once per boosting round. A twelve month tail is
+    296,531 rows and the run may build thousands of trees, so the eval is paid for
+    thousands of times while the answer it gives barely moves.
+
+    ``None`` keeps every row. Fewer rows in the tail than asked for also keeps every row.
+    """
+    if sample_rows is None or int(in_tail.sum()) <= sample_rows:
+        return in_tail
+    positions = np.flatnonzero(in_tail)
+    kept = np.random.default_rng(seed).choice(positions, size=sample_rows, replace=False)
+    sampled = np.zeros_like(in_tail)
+    sampled[kept] = True
+    return sampled
+
+
+def cut_validation_tail(
+    frame: pd.DataFrame,
+    first_validation_month: str = DEFAULT_VALIDATION_START,
+    time_column: str = "time",
+    sample_rows: int | None = None,
+    seed: int = 0,
+) -> dict[str, pd.DataFrame]:
+    """Cut a training frame into the part fitted on and a validation tail after it.
+
+    The tail is the end of the training period, so a model that stops on it stops on
+    posts later than every post it learned from. Nothing here touches the test split.
+
+    ``sample_rows`` bounds the returned validation frame. The rows it drops are dropped
+    from scoring only: they are not returned in ``fit`` either, so the fit set is the same
+    whether sampling is on or off and two runs stay comparable.
+
+    Raises if the boundary leaves either side empty, because a validation slice of zero
+    rows would make early stopping fire on the first round and look like a real answer.
+    """
+    in_tail = validation_tail_mask(frame[time_column], first_validation_month)
+    if not in_tail.any():
+        raise ValueError(f"no rows at or after {first_validation_month}: validation tail is empty")
+    if in_tail.all():
+        raise ValueError(f"no rows before {first_validation_month}: nothing left to fit on")
+    evaluated = sample_validation_tail(in_tail, sample_rows, seed)
+    return {"fit": frame.loc[~in_tail].copy(), "validation": frame.loc[evaluated].copy()}
 
 
 def rows_before(times: np.ndarray, cutoff: pd.Timestamp) -> np.ndarray:

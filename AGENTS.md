@@ -24,9 +24,9 @@ free of submodule imports so `import hn_upvotes` stays cheap and dependency free
 
 xgboost needs an OpenMP runtime, which macOS does not ship, so `import xgboost` fails
 with a `libomp.dylib` error out of the box. `brew install libomp` is the official fix.
-`make baselines` avoids needing it by pointing `DYLD_LIBRARY_PATH` at the copy
-scikit-learn's own wheel already carries inside `.venv`. Run rung 5 any other way and
-that variable has to be set the same way.
+`make baselines` and `make tune-xgboost` avoid needing it by pointing `DYLD_LIBRARY_PATH`
+at the copy scikit-learn's own wheel already carries inside `.venv`. Run rung 6 any other
+way and that variable has to be set the same way.
 
 ## Column names are Hacker News's, not ours
 
@@ -52,7 +52,11 @@ These are enforced by tests. Do not weaken either to make something pass.
    Every rung of the baseline ladder goes through one of those two, so there is one
    place to get it wrong. The easy mistake is a mean taken over the whole training set
    and then applied to every row of that key; `tests/test_author_history_bound.py`
-   exists to catch exactly that.
+   exists to catch exactly that. Anything needing a validation slice takes it from
+   `splits.cut_validation_tail`, the last months of the training period, never a random
+   sample. Its scored rows may be subsampled for speed and that is safe, because
+   `sample_validation_tail` returns a subset of the tail mask and the rows it drops do
+   not rejoin the fit set.
 
 ## Design decisions that are argued, not incidental
 
@@ -89,6 +93,31 @@ shown to be hiding something; `splits.walk_forward_folds` is the seam and says s
 by 3.6% end to end (1.191 to 1.149) and Spearman by six times (0.050 to 0.297). 49.5% of
 test posts score 1 or 2, so a constant is already near half the data and absolute error
 has almost nothing left to win. An RMSE-only table would read as "nothing works".
+
+**Rung 6 was underfitting and it still loses to Ridge. Both halves are the result.** Early
+stopping against a held-back year ran to 2,303 trees, 4.6x the untuned 500, stopping early
+rather than hitting the 5,000 ceiling. Every metric improved the whole way, 0.2635 to
+0.2799 Spearman. Ridge is still ahead at 0.2971, and at 0.2890 on the identical reduced
+rows, for 157 seconds of fitting against 4,817. So underfitting explains about half the
+original gap and the other half is trees being wrong for a hundred thousand sparse columns.
+**Do not tune rung 6 further to close it.** Depth, not tree count, is the only knob left
+worth trying, and it was deliberately not tried: a baseline tuned until it wins is not a
+baseline. Reasoning in `docs/design.md`, "Was rung 6 underfitting?".
+
+**`early_stopping_rounds` alone is not a stopping rule; set `min_delta` with it.** Its
+default minimum improvement is 0, so an improvement of a few millionths resets the patience
+counter. Rung 6's curve improved by a mean 2.16e-06 an round over its last 800 rounds and
+still ran to 2,303 trees. It did stop before the 5,000 ceiling, but only just, and a run
+ended by its ceiling has measured the ceiling. Replaying that curve, `min_delta=1e-4` stops
+at 1,600 trees for 0.0015 of RMSE. Always report which of the two ended a run.
+
+**Anything passing an eval set to XGBoost must use `xgboost.train`, not `XGBRegressor`.**
+The wrapper builds eval sets as `QuantileDMatrix`, which has no incremental prediction
+cache, so every round re-scores the whole slice. Measured on the real matrix, same 296,531
+row slice: 95.13 seconds a round through the wrapper against 4.52 native. That is the
+difference between a six day run and a six hour one. `models/baselines.EarlyStoppedXGBoost`
+is the worked example, including setting `base_score` by hand because the two APIs pick a
+starting value differently.
 
 **Precision@100 does not discriminate at this scale.** Every rung scores 0, 1 or 2 hits,
 and 100 random rows out of 599,937 would be expected to hit 0.017 times. Use it to show
@@ -187,8 +216,9 @@ costs sit outside it and are not measured: gensim's half of each gate, and the H
 reader's real throughput. If it stops fitting, cut epochs on the HN stages, not an objective.
 
 Embedding tests need the `train` extra, which the base install and the main CI job do not
-carry, so they `importorskip`. The separate `embeddings` CI job installs the CPU torch wheel and
-runs them; without that job they would never run anywhere.
+carry, so they `importorskip`. The separate `train-extra` CI job installs the CPU torch wheel
+and runs them; without that job they would never run anywhere. Anything else needing that
+extra has to be added to that job by name, or it silently never runs.
 
 ## Maintaining this file
 

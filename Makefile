@@ -59,6 +59,12 @@ OMP_DIR := $(shell ls -d $(VENV)/lib/python*/site-packages/sklearn/.dylibs 2>/de
 baselines: ## Phase 2. Fit the five baseline rungs and print the results table
 	DYLD_LIBRARY_PATH="$(OMP_DIR)" $(BIN)/python -m hn_upvotes.training.run_baselines
 
+# Hours, not minutes: the tree count is whatever early stopping picks. Same OpenMP
+# workaround as `make baselines`.
+.PHONY: tune-xgboost
+tune-xgboost: ## Phase 2. Early-stop rung 6 against a held-back year, and score it
+	DYLD_LIBRARY_PATH="$(OMP_DIR)" $(BIN)/python -m hn_upvotes.training.tune_xgboost
+
 .PHONY: notebook
 notebook: ## Phase 1. Re-execute the EDA notebook in place, outputs and all
 	$(BIN)/jupyter execute --inplace notebooks/01-eda.ipynb
