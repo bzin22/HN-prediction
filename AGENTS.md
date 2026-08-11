@@ -24,9 +24,9 @@ free of submodule imports so `import hn_upvotes` stays cheap and dependency free
 
 xgboost needs an OpenMP runtime, which macOS does not ship, so `import xgboost` fails
 with a `libomp.dylib` error out of the box. `brew install libomp` is the official fix.
-`make baselines` avoids needing it by pointing `DYLD_LIBRARY_PATH` at the copy
-scikit-learn's own wheel already carries inside `.venv`. Run rung 5 any other way and
-that variable has to be set the same way.
+`make baselines` and `make tune-xgboost` avoid needing it by pointing `DYLD_LIBRARY_PATH`
+at the copy scikit-learn's own wheel already carries inside `.venv`. Run rung 6 any other
+way and that variable has to be set the same way.
 
 ## Column names are Hacker News's, not ours
 

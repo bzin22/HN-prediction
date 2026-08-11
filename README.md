@@ -58,11 +58,10 @@ One time-based split: 3,568,252 training rows from 2006-10 to 2022-11 and 599,93
 rows from 2024-01 to 2025-12. The 571,018 rows between and after them are dropped because
 the archive recorded those scores at submission, before anyone had voted.
 
-Six baselines, all predicting `log1p(score)`, plus rung 6 re-run with early stopping as
-6b. Rung 6b is fitted on 296,531 fewer rows, because those are the validation tail it
-stops on. Spearman is rank correlation: it compares
-two orderings and ignores the actual numbers, 1 if they order posts identically and 0 if
-there is no relationship. Precision@100 is in
+Six baselines, all predicting `log1p(score)`, plus rung 6 re-run with early stopping as 6b.
+Rung 6b is fitted on 296,531 fewer rows, because those are the validation tail it stops on.
+Spearman is rank correlation: it compares two orderings and ignores the actual numbers, 1 if
+they order posts identically and 0 if there is no relationship. Precision@100 is in
 [`docs/design.md`](docs/design.md#the-reporting-format) with the full table.
 
 | Rung | Sees | Trees | RMSE | MAE | Spearman |
