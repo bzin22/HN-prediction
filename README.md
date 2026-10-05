@@ -149,7 +149,7 @@ rung 3 on the 13.8% whose host has none. `make baselines` reproduces rungs 1 to 
 | 0 | Repo, README, scaffold, CI | Done |
 | 1 | Ingest and EDA, three gates, leak audit | Done |
 | 2 | Time split, six baseline rungs, the metrics that report them | Done |
-| 3 | CBOW and Skip-gram on text8, validated against gensim, then the Wikipedia subset | Implemented and tuned, no variant trained yet |
+| 3 | CBOW and Skip-gram on text8, validated against gensim, then English Wikipedia | Implemented and tuned, no variant trained yet |
 | 4 | HN fine-tuning, three-variant comparison | Not started |
 | 5 | Early, late and hybrid fusion, plus ablations | Not started |
 | 6 | FastAPI and Docker | Not started |
@@ -157,7 +157,7 @@ rung 3 on the 13.8% whose host has none. `make baselines` reproduces rungs 1 to 
 
 ## Phase 3: the implementation, before any training
 
-CBOW and Skip-gram are implemented from scratch and the overnight training chain is wired
+CBOW and Skip-gram are implemented from scratch and the training chain is wired
 up for both. **No embedding variant has been produced yet**, by design: the algorithms get
 reviewed before a night is spent. text8 has been trained on for two hyperparameter
 measurements and nothing else, at 5M and 120k tokens. The reasoning is in
@@ -183,16 +183,16 @@ is the embedding backward, and a step touching 16,000 rows of 300 floats is too 
 arithmetic to pay for MPS kernel launches. This is why gensim is CPU threads with no GPU.
 `select_device()` returns CPU as a result, against the scaffold's assumption.
 
-That throughput sizes the Wikipedia stage rather than a guess doing it. At `k = 5` and a
-two-hour ceiling over 5 epochs: `138,362 x 0.96 x 7,200 / 5 = 191,271,628` tokens, about
-1.13 GB.
+The Wikipedia stage reads all eligible articles from the English `20231101.en` snapshot.
+Both objectives use the same corpus. Training has no time limit, and throughput estimates
+no longer determine corpus size. Each stage runs its configured number of epochs.
 
 ```bash
 make throughput      # the two measurements above
 make lr-sweep        # four learning rates on text8, three seeds each, about 25 minutes
 make batch-scaling   # the batch-size rate multiplication against a batch-1 run, minutes
 make chain-dry-run   # both objectives, every stage, synthetic corpora, about 20 seconds
-make chain           # the real overnight run, detached
+make chain           # the real training run, detached; no time limit
 ```
 
 ### Two hyperparameter claims, now measured on text8
@@ -246,12 +246,41 @@ worse**. Then the three variants, with `hn-only` last so a Wikipedia failure cos
 instead of the night. Artefacts are `{objective}-{stage}.npz`, a CBOW failure cannot cost the
 Skip-gram variants, and a resume does not restart an objective that already finished.
 
-**A night is 7.5 hours expected against 11.0 hours of ceilings**, so it fits. CBOW is the cheap
-half at 2.3 hours against Skip-gram's 5.2, because it is 2.2x faster per corpus token. The HN
-corpus is counted rather than guessed: 75,283,676 tokens over 5,091,739 lines. If it stops
-fitting, the lever is epochs on the HN stages, not an objective. See
-[`docs/word2vec.md`](docs/word2vec.md) for the stage-by-stage table and the three costs that
-sit outside it.
+**There is no total or per-stage time limit.** The former 7.5-hour estimate applied to a
+limited Wikipedia subset and does not describe the full corpus. Runtime estimates now
+require a Wikipedia token count. The recorded HN count is 75,283,676 tokens over
+5,091,739 lines; recount it after input or date-filter changes.
+
+The English Wikipedia source lists an 11.63 GB compressed download and 20.20 GB of prepared
+records. The HN source currently lists 12.4 GB of files, including comments. The project's
+local filtered story table is 0.365 GB, checked on 2026-10-02. These sizes measure different
+stages of preparation. See [`docs/word2vec.md`](docs/word2vec.md#corpus-size-and-runtime) for sources.
+
+The full Wikipedia export uses bounded batches and an atomic file replacement. Its filename
+is `wikipedia-20231101-en.txt`; an older `wikipedia-subset.txt` is not reused as a full corpus.
+Resume rejects checkpoints when their vocabulary or counts differ from the current corpus.
+The chain excludes HN text from December 2021 onward, using the validation boundary.
+The November 2023 Wikipedia snapshot predates the test period but not validation.
+
+To train both objectives on the combined sources, use a fresh run directory:
+
+```bash
+caffeinate -ism .venv/bin/python -m hn_upvotes.embeddings.full_run \
+  --run-directory runs/full-joint-20261002
+```
+
+This run checks both objectives on text8 before it acquires Wikipedia. Each epoch uses
+all eligible Wikipedia articles and all HN training-period titles and bodies. Documents
+are interleaved in their natural proportions. There is no time or corpus-size limit.
+The default is five epochs, 300 dimensions, and a vocabulary of 100,000 words.
+After both final models pass reload and completion checks, the run deletes its own corpus
+files. It keeps models, checkpoints, logs, vocabulary, and the original HN story table.
+A failed run retains its data. Read `status.json` in the run directory for progress.
+
+**Current limitation:** the October 2, 2026 run stopped at both text8 gates after 44 minutes.
+Full Wikipedia + HN training did not start. The installed gensim 4.4.0 reference also has a
+confirmed dot-product error; its effect on the scores is unmeasured. The correction is still
+pending. See [the recorded limitations](docs/word2vec.md#what-is-not-proved-yet).
 
 ## Getting started
 
@@ -299,9 +328,9 @@ carrying its real type-annotated signature and a docstring saying what it will d
 
 ## Hardware
 
-An Apple M2 with 24 GB of unified memory. No CUDA, no cloud GPU. Full English Wikipedia is
-out of scope, so the embedding corpus is a subset sized from a measured throughput number,
-which came out at about 191M tokens for a two-hour ceiling.
+An Apple M2 with 24 GB of unified memory. No CUDA, no cloud GPU. The Wikipedia export reads
+bounded batches and training streams the resulting text file. The full English snapshot
+is no longer reduced to fit a time limit. Its end-to-end runtime has not been measured.
 
 **Word2vec training runs on the CPU, not the MPS backend.** Phase 3 measured CPU at 4.3x
 MPS for this workload, because the steps are too small to pay for GPU kernel launches. MPS

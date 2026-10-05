@@ -87,7 +87,7 @@ batch-scaling: ## Phase 3. Check the batch-size rate multiplication against batc
 	$(BIN)/python -m hn_upvotes.embeddings.batch_scaling
 
 .PHONY: hn-token-count
-hn-token-count: ## Phase 3. Count the Hacker News corpus, which the overnight budget needs
+hn-token-count: ## Phase 3. Count the Hacker News corpus for runtime estimates
 	$(BIN)/python -m hn_upvotes.embeddings.corpora
 
 .PHONY: chain-dry-run
@@ -95,12 +95,12 @@ chain-dry-run: ## Phase 3. Walk every stage of both objectives on synthetic corp
 	$(BIN)/python -m hn_upvotes.embeddings.chain --dry-run \
 		--output-directory artifacts/embeddings-dry-run
 
-# The real overnight run. Both objectives, four stages each, six variants. Detached, so it
+# The full training run, without time limits. Both objectives, four stages each, six variants. Detached, so it
 # survives the terminal closing, and it writes artifacts/embeddings/run-manifest.json as it
 # goes. Read that file in the morning, not the log. Add --resume to carry on from the newest
 # checkpoint of each stage, which does not restart an objective that already finished.
 .PHONY: chain
-chain: ## Phase 3. Launch the overnight chain for both objectives, detached
+chain: ## Phase 3. Launch the training chain for both objectives, detached
 	$(BIN)/python -m hn_upvotes.embeddings.chain --detach
 
 .PHONY: serve

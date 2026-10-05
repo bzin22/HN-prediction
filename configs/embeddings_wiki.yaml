@@ -1,13 +1,10 @@
-# Wikipedia subset. Not full English Wikipedia: this trains on an Apple M2 with 24 GB
-# and no CUDA, and a from-scratch PyTorch SGNS runs one to two orders of magnitude
-# slower than gensim's Cython. The subset size is set from a measured tokens-per-second
-# number in Phase 3, not guessed here.
+# Full eligible English Wikipedia from the 20231101 snapshot. Both objectives read
+# the same corpus. There is no time limit or throughput-derived corpus-size limit.
 #
 # k = 5 rather than 15. Mikolov et al. 2013 recommends 2 to 5 negative samples for
 # large corpora, against 5 to 20 for small ones.
 
-corpus: wikipedia-subset
-subset_gb: null         # filled in from the measured throughput in Phase 3
+corpus: wikipedia-20231101.en
 objective: skipgram
 dimension: 300
 window: 5

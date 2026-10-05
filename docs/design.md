@@ -407,7 +407,7 @@ ages, and gets the instant from a live read of the HN API instead.
 
 The implementation and the measurements behind it are in
 [`word2vec.md`](word2vec.md): the two matrices, why negative sampling, why plain SGD, the
-CPU-against-MPS throughput result, and the overnight training chain. This section holds the
+CPU-against-MPS throughput result, and the training chain. This section holds the
 hyperparameters and the plan.
 
 ### Terminology
@@ -434,7 +434,7 @@ sampling. Hyperparameters follow Mikolov et al. 2013.
 | Setting | Value | Source |
 |---|---|---|
 | Negative samples `k`, text8 and HN titles | 15 | Paper recommends 5 to 20 for small corpora |
-| Negative samples `k`, Wikipedia subset | 5 | Paper recommends 2 to 5 for large corpora |
+| Negative samples `k`, English Wikipedia | 5 | Paper recommends 2 to 5 for large corpora |
 | Noise distribution | Unigram counts raised to 0.75 | The paper's tuned value, best of the distributions tried |
 | Frequent-word subsampling | `t = 1e-5` | The paper's rule, `P(keep) = min(1, sqrt(t/f))` |
 | Context window | Dynamic, sampled from 1 to 5 | Weights nearer context words more heavily at no extra cost |
@@ -447,10 +447,11 @@ often than their raw frequency would allow. `k` is tunable and these are startin
 Development runs on `text8`, 100 MB, which trains in minutes and makes the
 implementation debuggable. Correctness is checked against gensim on the same corpus
 before anything scales up. Matching gensim within noise on text8 is the gate for moving
-to the Wikipedia subset.
+to the English Wikipedia corpus.
 
 A from-scratch PyTorch SGNS runs one to two orders of magnitude slower than gensim's
-Cython. The subset size is chosen from a measured tokens-per-second figure, not a guess.
+Cython. Runtime estimates use measured throughput. The corpus is no longer reduced to fit
+an elapsed-time limit.
 
 Intrinsic evaluation uses the Google analogy set, WordSim-353, and nearest-neighbour
 spot checks on HN vocabulary (`rust`, `yc`, `llm`). Coverage is reported alongside
@@ -461,7 +462,7 @@ can answer. Intrinsic scores are a sanity check. The result is the downstream ta
 
 | Variant | Initialisation | Trained on |
 |---|---|---|
-| wiki-only | Random | Wikipedia subset |
+| wiki-only | Random | English Wikipedia snapshot |
 | hn-only | Random | HN titles |
 | fine-tuned | Wikipedia vectors | HN titles at a lower learning rate |
 

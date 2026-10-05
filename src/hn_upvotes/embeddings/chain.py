@@ -1,4 +1,4 @@
-"""The overnight training chain: two objectives, four stages each, nobody watching.
+"""The training chain: two objectives, four stages each, without time limits.
 
 Four stages per objective, and it is an order rather than a list:
 
@@ -6,8 +6,8 @@ Four stages per objective, and it is an order rather than a list:
    **A failure here aborts that objective.** That is the point of it: a bug otherwise costs
    a night of Wikipedia training and shows up in the morning, where this costs ten minutes
    and leaves the machine idle instead.
-1. **wiki-only** The Wikipedia subset. Its size is computed from measured throughput and the
-   stage's wall-clock ceiling, not picked.
+1. **wiki-only** All eligible text from the English Wikipedia snapshot.
+   Both objectives read the same corpus without a token limit.
 2. **fine-tuned** Stage 1's vectors, carried on over Hacker News titles and bodies at a tenth
    of the learning rate. Words Hacker News has and Wikipedia does not start random.
 3. **hn-only** Random initialisation, Hacker News text only. Last on purpose: it needs
@@ -23,8 +23,7 @@ The objectives are independent all the way down. A CBOW gate that aborts costs t
 CBOW variants and none of the Skip-gram ones, and the reverse.
 
 Everything unattended operation needs is here: a per-epoch checkpoint, ``--resume`` from the
-newest one, a wall-clock budget per stage that saves and yields rather than eating the next
-stage's time, per-stage failure isolation, and one JSON manifest written as it goes so the
+newest one, per-stage failure isolation, and one JSON manifest written as it goes so the
 morning's question is answered by one file rather than a log.
 
 ``--dry-run`` walks every stage of both objectives on synthetic corpora in about 20 seconds,
@@ -41,7 +40,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 import traceback
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
@@ -50,6 +48,7 @@ from pathlib import Path
 from typing import Literal
 
 from hn_upvotes.data.preprocess import build_vocabulary
+from hn_upvotes.data.splits import DEFAULT_VALIDATION_START
 from hn_upvotes.embeddings import corpora
 from hn_upvotes.embeddings.checkpoint import newest_checkpoint
 from hn_upvotes.embeddings.evaluate import (
@@ -75,9 +74,7 @@ STAGE_HN = "hn-only"
 OBJECTIVE_SKIPGRAM = "skipgram"
 OBJECTIVE_CBOW = "cbow"
 
-#: Both objectives, Skip-gram first. The order is deliberate: Skip-gram is the slower of the
-#: two and the one the Wikipedia subset is sized for, so running it first means a night that
-#: gets cut short loses the cheaper objective rather than the expensive one.
+#: Both objectives, Skip-gram first. Both read the same Wikipedia corpus.
 BOTH_OBJECTIVES: tuple[str, ...] = (OBJECTIVE_SKIPGRAM, OBJECTIVE_CBOW)
 
 #: The three variants each objective produces. The gate is not one of them: it keeps nothing.
@@ -122,10 +119,6 @@ DRY_RUN_CORPUS = {"topics": 10, "words_per_topic": 15, "lines_per_topic": 400, "
 #: 105,142 at 100,000.
 LARGE_VOCABULARY_FACTOR = 0.96
 
-#: Below this, the Wikipedia variant is barely larger than text8's 100 MB and the stage has
-#: lost its point. The chain stops and reports rather than quietly shipping a small corpus.
-MINIMUM_WIKIPEDIA_BYTES = 300_000_000
-
 #: The fine-tuning stage's learning rate, as a fraction of the from-scratch rate. A tenth,
 #: so Wikipedia's structure is adjusted rather than overwritten by a much smaller corpus.
 FINE_TUNE_RATE_FRACTION = 0.1
@@ -143,11 +136,12 @@ _CAFFEINATE_SENTINEL = "HN_CHAIN_CAFFEINATED"
 
 @dataclass(frozen=True)
 class ChainConfig:
-    """Where the chain writes, how long each stage may take, and which corpora it reads."""
+    """Where the chain writes, which corpora it reads, and how many epochs it trains."""
 
     output_directory: Path = Path("artifacts/embeddings")
     corpus_directory: Path = Path("data/corpora")
     hn_corpus_path: Path = corpora.HN_CORPUS_PATH
+    hn_before: str = DEFAULT_VALIDATION_START + "-01"
     analogy_path: Path | None = None
     wordsim_path: Path | None = None
 
@@ -156,14 +150,6 @@ class ChainConfig:
     objectives: tuple[Literal["cbow", "skipgram"], ...] = BOTH_OBJECTIVES
     dimension: int = 300
     epochs: int = 5
-
-    #: Wall-clock ceilings, **per stage per objective**. The Wikipedia one is the captain's
-    #: two hours and is a ceiling rather than a target: the subset size is computed to fit
-    #: inside it. See :func:`overnight_budget` for what the pair of objectives adds up to.
-    gate_budget_seconds: float = 30 * 60
-    wikipedia_budget_seconds: float = 2 * 60 * 60
-    finetune_budget_seconds: float = 90 * 60
-    hn_budget_seconds: float = 90 * 60
 
     dry_run: bool = False
     resume: bool = False
@@ -196,113 +182,57 @@ class ChainConfig:
         return f"{objective}-{stage}"
 
 
-def wikipedia_token_budget(
-    budget_seconds: float,
-    epochs: int,
-    negative_samples: int = 5,
-    tokens_per_second: float | None = None,
-) -> tuple[int, float]:
-    """How many Wikipedia tokens fit in ``budget_seconds``, and roughly how many bytes.
-
-    The stage is sized from measurement rather than picked and timed. The arithmetic, with
-    the numbers this machine measured:
-
-    ``138,362 tokens/s x 0.96 x 7,200 s / 5 epochs = 191,271,628 tokens``
-
-    and at 5.9 bytes per token that is about 1.13 GB. Every epoch reads the whole subset, so
-    dividing by ``epochs`` is what makes the ceiling a ceiling.
-
-    **Sized from Skip-gram's throughput for both objectives, on purpose.** Skip-gram is the
-    slower of the two, so the subset fits its ceiling and CBOW finishes the same corpus
-    early. Sizing each objective to fill its own two hours would give CBOW 2.2x the corpus,
-    and the CBOW-against-Skip-gram comparison would then be measuring corpus size.
-    """
-    rate = tokens_per_second or MEASURED_TOKENS_PER_SECOND.get(
-        negative_samples, MEASURED_TOKENS_PER_SECOND[5]
-    )
-    tokens = int(rate * LARGE_VOCABULARY_FACTOR * budget_seconds / max(epochs, 1))
-    return tokens, tokens * corpora.BYTES_PER_TOKEN
-
-
-def stage_seconds(
-    objective: str, tokens: int, epochs: int, negative_samples: int, ceiling: float
-) -> tuple[float, bool]:
-    """How long one stage is expected to take, and whether its ceiling will cut it short.
-
-    ``tokens`` is the corpus size for one epoch. The estimate is
-    ``tokens x epochs / (rate x 0.96)``, with the rate from
-    :data:`MEASURED_TOKENS_PER_SECOND` and multiplied by :data:`CBOW_SPEEDUP` for CBOW.
-    """
+def stage_seconds(objective: str, tokens: int, epochs: int, negative_samples: int) -> float:
+    """Estimate training time from token count and measured throughput. Never stop a run."""
     rate = MEASURED_TOKENS_PER_SECOND.get(negative_samples, MEASURED_TOKENS_PER_SECOND[5])
     rate *= LARGE_VOCABULARY_FACTOR
     if objective == OBJECTIVE_CBOW:
         rate *= CBOW_SPEEDUP
-    expected = tokens * epochs / rate
-    return (min(expected, ceiling), expected > ceiling)
+    return tokens * epochs / rate
 
 
-def overnight_budget(
+def estimate_training_time(
     config: ChainConfig,
+    wikipedia_tokens: int,
     hn_tokens: int = corpora.HN_CORPUS_TOKENS,
     gensim_gate_seconds: float = 0.0,
 ) -> dict:
-    """What a full run is expected to cost in wall clock, stage by stage and in total.
+    """Estimate stage runtimes from supplied corpus counts, without time limits.
 
-    Two numbers per stage, and they answer different questions. The **ceiling** is the hard
-    bound the chain enforces, so the total of the ceilings is the worst case and it is what
-    has to fit in a night. The **expected** time comes from the measured throughput and the
-    corpus size, so the total of those is what the night will actually take if nothing goes
-    wrong.
-
-    ``hn_tokens`` is the Hacker News corpus size in tokens, counted rather than guessed; see
-    :func:`hn_upvotes.embeddings.corpora.count_hn_tokens`. ``gensim_gate_seconds`` is added
-    to each gate stage because the gate trains gensim on text8 as well as us, and that time
-    is real but sits outside the training budget the chain enforces.
+    Downloads, vocabulary preparation, evaluation, and real reader overhead are excluded.
+    Supply a measured gensim runtime when available; its default is not an estimate.
     """
+    if wikipedia_tokens < 0 or hn_tokens < 0 or gensim_gate_seconds < 0:
+        raise ValueError("token counts and gensim runtime cannot be negative")
     tokens_by_stage = {
         STAGE_GATE: TEXT8_TOKENS,
-        STAGE_WIKI: wikipedia_token_budget(
-            config.wikipedia_budget_seconds, config.epochs, negative_samples=5
-        )[0],
+        STAGE_WIKI: wikipedia_tokens,
         STAGE_FINETUNE: hn_tokens,
         STAGE_HN: hn_tokens,
     }
-    ceilings = {
-        STAGE_GATE: config.gate_budget_seconds,
-        STAGE_WIKI: config.wikipedia_budget_seconds,
-        STAGE_FINETUNE: config.finetune_budget_seconds,
-        STAGE_HN: config.hn_budget_seconds,
-    }
     rows = []
     for objective in config.objectives:
-        for stage in (STAGE_GATE, STAGE_WIKI, STAGE_FINETUNE, STAGE_HN):
+        for stage, tokens in tokens_by_stage.items():
             negatives = 5 if stage == STAGE_WIKI else 15
-            expected, cut_short = stage_seconds(
-                objective, tokens_by_stage[stage], config.epochs, negatives, ceilings[stage]
-            )
+            expected = stage_seconds(objective, tokens, config.epochs, negatives)
             if stage == STAGE_GATE:
                 expected += gensim_gate_seconds
             rows.append(
                 {
                     "objective": objective,
                     "stage": stage,
-                    "corpus_tokens": tokens_by_stage[stage],
+                    "corpus_tokens": tokens,
                     "negative_samples": negatives,
-                    "ceiling_seconds": ceilings[stage],
                     "expected_seconds": round(expected, 1),
-                    "hits_ceiling": cut_short,
                 }
             )
     return {
         "objectives": list(config.objectives),
         "epochs": config.epochs,
+        "wikipedia_tokens": wikipedia_tokens,
         "hn_tokens": hn_tokens,
         "stages": rows,
-        "ceiling_hours": round(sum(row["ceiling_seconds"] for row in rows) / 3600, 2),
         "expected_hours": round(sum(row["expected_seconds"] for row in rows) / 3600, 2),
-        "stages_hitting_their_ceiling": [
-            f"{row['objective']}-{row['stage']}" for row in rows if row["hits_ceiling"]
-        ],
     }
 
 
@@ -442,7 +372,7 @@ class StageOutcome:
     def usable(self) -> bool:
         """True when a later stage can build on this one's vectors.
 
-        A stage cut short by its budget still counts. Its matrix had less training than it
+        An older stage cut short by a deadline still counts. Its matrix had less training than it
         was configured for, which is recorded, but it is real and fine-tuning from it beats
         fine-tuning from noise.
         """
@@ -497,10 +427,9 @@ def _train_stage(
     chain_config: ChainConfig,
     manifest: RunManifest,
     record: dict,
-    budget_seconds: float,
     initial: TrainedEmbeddings | None = None,
 ) -> StageOutcome:
-    """Build the vocabulary, train under a deadline, checkpoint, and save the artefact."""
+    """Build the vocabulary, train all configured epochs, checkpoint, and save the artefact."""
     vocabulary = build_vocabulary(
         reopen_corpus(),
         min_count=stage_config.min_count,
@@ -518,6 +447,14 @@ def _train_stage(
         else None
     )
     if resume is not None:
+        if (
+            resume.vocabulary.index_to_word != vocabulary.index_to_word
+            or resume.vocabulary.counts.tolist() != vocabulary.counts.tolist()
+        ):
+            raise ValueError(
+                "checkpoint vocabulary or counts differ from the current corpus; "
+                "use a new output directory when replacing a limited corpus"
+            )
         record["detail"]["resumed_from_epoch"] = resume.epochs_done
 
     trained = train_embeddings_from_lines(
@@ -529,7 +466,7 @@ def _train_stage(
         checkpoint_directory=chain_config.checkpoint_directory,
         stage=checkpoint_stage,
         resume=resume,
-        deadline=time.monotonic() + budget_seconds,
+        progress_every=5_000,
     )
     if trained.cut_short:
         status = "cut_short"
@@ -614,7 +551,6 @@ def _run_gate(config: ChainConfig, manifest: RunManifest, objective: str) -> Sta
         config,
         manifest,
         record,
-        config.gate_budget_seconds,
     )
     if outcome.embeddings is None:
         return StageOutcome(status="failed", notes=["gate produced no vectors"])
@@ -656,36 +592,15 @@ class _Reiterable:
 
 
 def _run_wikipedia(config: ChainConfig, manifest: RunManifest, objective: str) -> StageOutcome:
-    """Stage 1. Size the subset from measured throughput, then train on that much.
-
-    The subset is written once and both objectives read the same file with the same token
-    budget, so the CBOW-against-Skip-gram comparison is not confounded by corpus size.
-    """
+    """Train on the shared English Wikipedia corpus without time or token limits."""
     stage_config = _stage_config(config, STAGE_WIKI, objective)
-    tokens, approximate_bytes = wikipedia_token_budget(
-        config.wikipedia_budget_seconds,
-        stage_config.epochs,
-        stage_config.negative_samples,
-    )
+    # A new name prevents an old time-limited subset from being reused as the full corpus.
+    corpus_path = config.corpus_directory / "wikipedia-20231101-en.txt"
     detail = {
-        "budget_seconds": config.wikipedia_budget_seconds,
-        "tokens_per_second_assumed": MEASURED_TOKENS_PER_SECOND[stage_config.negative_samples],
-        "large_vocabulary_factor": LARGE_VOCABULARY_FACTOR,
-        "token_budget": tokens,
-        "approximate_bytes": int(approximate_bytes),
-        "sized_for_objective": OBJECTIVE_SKIPGRAM,
+        "corpus": "synthetic" if config.dry_run else corpora.WIKIPEDIA_PARQUET_GLOB,
+        "corpus_path": None if config.dry_run else str(corpus_path),
     }
     record = manifest.start_stage(objective, STAGE_WIKI, detail)
-
-    if not config.dry_run and approximate_bytes < MINIMUM_WIKIPEDIA_BYTES:
-        note = (
-            f"two hours buys {tokens:,} tokens, about {approximate_bytes / 1e6:.0f} MB, "
-            f"below the {MINIMUM_WIKIPEDIA_BYTES / 1e6:.0f} MB floor. Stopping for a "
-            f"decision rather than shrinking the corpus quietly. Levers: fewer epochs, "
-            f"a smaller dimension, or accepting a smaller subset."
-        )
-        manifest.finish_stage(record, "needs_decision", notes=[note])
-        return StageOutcome(status="needs_decision", notes=[note])
 
     if config.dry_run:
         lines, _ = corpora.topic_corpus(**DRY_RUN_CORPUS, seed=1)
@@ -693,12 +608,11 @@ def _run_wikipedia(config: ChainConfig, manifest: RunManifest, objective: str) -
         def reopen() -> Iterator[list[str]]:
             return iter(lines)
     else:
-        subset_path = config.corpus_directory / "wikipedia-subset.txt"
-        if not subset_path.exists():
-            corpora.prepare_wikipedia_subset(subset_path, tokens)
+        if not corpus_path.exists():
+            corpora.prepare_wikipedia_corpus(corpus_path)
 
         def reopen() -> Iterator[list[str]]:
-            return corpora.stream_plain_text(subset_path, token_budget=tokens)
+            return corpora.stream_plain_text(corpus_path)
 
     return _train_stage(
         objective,
@@ -708,7 +622,6 @@ def _run_wikipedia(config: ChainConfig, manifest: RunManifest, objective: str) -
         config,
         manifest,
         record,
-        config.wikipedia_budget_seconds,
     )
 
 
@@ -717,7 +630,9 @@ def _hn_corpus(config: ChainConfig, seed: int) -> Callable[[], Iterator[list[str
     if config.dry_run:
         lines, _ = corpora.topic_corpus(**DRY_RUN_CORPUS, seed=seed)
         return lambda: iter(lines)
-    return lambda: corpora.stream_hn_text(config.hn_corpus_path, include_bodies=True)
+    return lambda: corpora.stream_hn_text(
+        config.hn_corpus_path, include_bodies=True, before=config.hn_before
+    )
 
 
 def _run_finetune(
@@ -756,7 +671,6 @@ def _run_finetune(
         config,
         manifest,
         record,
-        config.finetune_budget_seconds,
         initial=wikipedia.embeddings,
     )
 
@@ -773,7 +687,6 @@ def _run_hn_only(config: ChainConfig, manifest: RunManifest, objective: str) -> 
         config,
         manifest,
         record,
-        config.hn_budget_seconds,
     )
 
 
@@ -1003,12 +916,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dimension", type=int, default=300)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument(
-        "--wikipedia-hours",
-        type=float,
-        default=2.0,
-        help="ceiling for the Wikipedia stage; the subset size is computed to fit it",
-    )
-    parser.add_argument(
         "--detach",
         action="store_true",
         help="relaunch in the background, logging to a file, and return immediately",
@@ -1034,7 +941,6 @@ def main(argv: list[str] | None = None) -> int:
         objectives=tuple(dict.fromkeys(args.objectives)),
         dimension=args.dimension,
         epochs=args.epochs,
-        wikipedia_budget_seconds=args.wikipedia_hours * 3600,
         dry_run=args.dry_run,
         resume=args.resume,
     )

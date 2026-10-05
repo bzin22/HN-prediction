@@ -7,10 +7,10 @@ rather than a hope:
 * the gate aborts an objective when its vectors are meaningfully worse than gensim's, and
   costs that objective only,
 * a stage that blows up does not take the stages after it, or the other objective, with it,
-* a stage that runs out of wall clock saves what it has and says it was cut short,
+* stages train every configured epoch without an implicit deadline,
+* checkpoints from older cut-short stages can still be resumed,
 * a resume carries on rather than starting over, and does not restart a finished objective,
-* the Wikipedia subset size is arithmetic on a measured number, and both objectives get the
-  same subset.
+* both objectives read the same complete Wikipedia corpus.
 
 All of it runs on synthetic corpora, CPU only, no network.
 """
@@ -27,7 +27,6 @@ from hn_upvotes.data.preprocess import build_vocabulary  # noqa: E402
 from hn_upvotes.embeddings import chain as chain_module  # noqa: E402
 from hn_upvotes.embeddings.chain import (  # noqa: E402
     BOTH_OBJECTIVES,
-    MINIMUM_WIKIPEDIA_BYTES,
     OBJECTIVE_CBOW,
     OBJECTIVE_SKIPGRAM,
     STAGE_FINETUNE,
@@ -37,9 +36,8 @@ from hn_upvotes.embeddings.chain import (  # noqa: E402
     VARIANT_STAGES,
     ChainConfig,
     caffeinate_command,
-    overnight_budget,
+    estimate_training_time,
     run_chain,
-    wikipedia_token_budget,
 )
 from hn_upvotes.embeddings.checkpoint import Checkpoint, newest_checkpoint  # noqa: E402
 from hn_upvotes.embeddings.corpora import topic_corpus  # noqa: E402
@@ -65,15 +63,30 @@ def _statuses(manifest: dict) -> dict[str, str]:
     return {stage["name"]: stage["status"] for stage in manifest["stages"]}
 
 
-def test_dry_run_completes_every_stage_of_both_objectives_and_writes_six_variants(tmp_path):
+def test_dry_run_completes_every_stage_of_both_objectives_and_writes_six_variants(
+    tmp_path, monkeypatch
+):
     """The whole chain, end to end, on synthetic corpora.
 
     This is the review artefact: it proves the ordering, the gate, the checkpointing and the
     manifest all work for both objectives without spending a night on it.
     """
+    real_train = chain_module.train_embeddings_from_lines
+    stages_without_deadlines = []
+
+    def train_without_deadline(*args, **kwargs):
+        assert kwargs.get("deadline") is None
+        stages_without_deadlines.append(kwargs["stage"])
+        return real_train(*args, **kwargs)
+
+    monkeypatch.setattr(chain_module, "train_embeddings_from_lines", train_without_deadline)
     config = _config(tmp_path)
     manifest = run_chain(config)
 
+    assert len(stages_without_deadlines) == 8
+    assert all(
+        stage["epochs_completed"] == stage["epochs_configured"] for stage in manifest["stages"]
+    )
     assert manifest["outcome"] == "completed"
     assert manifest["objectives"] == list(BOTH_OBJECTIVES)
     expected = {
@@ -331,9 +344,23 @@ def test_a_failing_stage_does_not_take_the_next_ones_with_it(tmp_path, monkeypat
     assert "Traceback" in failure["traceback"]
 
 
-def test_a_stage_out_of_wall_clock_saves_what_it_has_and_says_so(tmp_path):
-    """A zero-length budget must yield rather than run to completion or lose the work."""
-    config = _one_objective(tmp_path, wikipedia_budget_seconds=0.0)
+def _interrupt_wikipedia(monkeypatch):
+    """Inject an explicit diagnostic deadline to simulate an older partial checkpoint."""
+    real_train = chain_module.train_embeddings_from_lines
+
+    def interrupted(*args, **kwargs):
+        if kwargs["stage"].endswith(STAGE_WIKI):
+            kwargs["deadline"] = 0.0
+        return real_train(*args, **kwargs)
+
+    monkeypatch.setattr(chain_module, "train_embeddings_from_lines", interrupted)
+    return real_train
+
+
+def test_an_explicitly_interrupted_stage_preserves_its_partial_checkpoint(tmp_path, monkeypatch):
+    """The lower-level diagnostic deadline still preserves recoverable work."""
+    _interrupt_wikipedia(monkeypatch)
+    config = _one_objective(tmp_path)
     manifest = run_chain(config)
 
     wikipedia = next(s for s in manifest["stages"] if s["stage"] == STAGE_WIKI)
@@ -352,16 +379,18 @@ def test_a_stage_out_of_wall_clock_saves_what_it_has_and_says_so(tmp_path):
     assert _statuses(manifest)[f"{OBJECTIVE_SKIPGRAM}-{STAGE_FINETUNE}"] == "completed"
 
 
-def test_resume_carries_on_and_the_epoch_count_does_not_drift(tmp_path):
+def test_resume_carries_on_and_the_epoch_count_does_not_drift(tmp_path, monkeypatch):
     """Cut a stage short, resume, and it must finish exactly its configured epochs.
 
     The bug this guards is real and was found here: a partial epoch's loss appended to the
     per-epoch list made a resumed stage report 4 epochs completed out of 3.
     """
-    config = _one_objective(tmp_path, wikipedia_budget_seconds=0.0)
+    real_train = _interrupt_wikipedia(monkeypatch)
+    config = _one_objective(tmp_path)
     first = run_chain(config)
     assert _statuses(first)[f"{OBJECTIVE_SKIPGRAM}-{STAGE_WIKI}"] == "cut_short"
 
+    monkeypatch.setattr(chain_module, "train_embeddings_from_lines", real_train)
     resumed = run_chain(_one_objective(tmp_path, resume=True))
     wikipedia = next(s for s in resumed["stages"] if s["stage"] == STAGE_WIKI)
     assert wikipedia["status"] == "completed"
@@ -431,98 +460,81 @@ def test_checkpoint_carries_both_matrices_and_the_newest_wins(tmp_path):
     assert not list(tmp_path.glob("*.partial.npz"))
 
 
-def test_wikipedia_subset_size_is_arithmetic_on_a_measured_number():
-    """The subset is sized from throughput and the ceiling, not picked and then timed.
+def test_both_objectives_read_the_complete_corpus_and_ignore_old_subsets(tmp_path, monkeypatch):
+    """A real reader must reach the last document and reuse the same file for both objectives."""
+    config = ChainConfig(corpus_directory=tmp_path, output_directory=tmp_path / "out")
+    (tmp_path / "wikipedia-subset.txt").write_text("obsolete subset\n")
+    prepared = []
+    observed = []
 
-    Measured on this machine: 138,362 in-vocabulary tokens/s for skip-gram at ``k=5``,
-    dimension 300, batch 1024, CPU with sparse gradients. Times the 0.96 large-vocabulary
-    factor, times a 7,200 second ceiling, divided by 5 epochs:
+    def prepare(path):
+        prepared.append(path)
+        path.write_text("first document\nlast document\n")
+        return path
 
-    ``138,362 x 0.96 x 7,200 / 5 = 191,271,628 tokens``
+    def capture(objective, stage, reopen, *args, **kwargs):
+        observed.append((objective, list(reopen())))
+        return chain_module.StageOutcome(status="completed")
 
-    and at 5.9 bytes per token that is 1.129 GB, comfortably over the 300 MB floor.
-    """
-    tokens, approximate_bytes = wikipedia_token_budget(
-        budget_seconds=7_200, epochs=5, negative_samples=5
-    )
-    assert tokens == pytest.approx(191_271_628, rel=1e-6)
-    assert approximate_bytes / 1e9 == pytest.approx(1.129, abs=0.01)
-    assert approximate_bytes > MINIMUM_WIKIPEDIA_BYTES
+    monkeypatch.setattr(chain_module.corpora, "prepare_wikipedia_corpus", prepare)
+    monkeypatch.setattr(chain_module, "_train_stage", capture)
+    manifest = chain_module.RunManifest(config.manifest_path, config, "cpu")
+    for objective in BOTH_OBJECTIVES:
+        chain_module._run_wikipedia(config, manifest, objective)
 
-    # Dividing by the epoch count is what makes the ceiling a ceiling: every epoch rereads
-    # the whole subset, so twice the epochs must halve the corpus.
-    half, _ = wikipedia_token_budget(budget_seconds=7_200, epochs=10, negative_samples=5)
-    assert half == pytest.approx(tokens / 2, rel=1e-6)
-
-    # k=15 is the slower setting, so it buys fewer tokens in the same time.
-    fewer, _ = wikipedia_token_budget(budget_seconds=7_200, epochs=5, negative_samples=15)
-    assert fewer < tokens
-
-
-def test_both_objectives_read_the_same_wikipedia_subset(tmp_path):
-    """Sized from Skip-gram's throughput for both, so CBOW finishes the same corpus early.
-
-    Giving each objective its own two hours would hand CBOW 2.2x the tokens, and the
-    CBOW-against-Skip-gram comparison would then be measuring corpus size.
-    """
-    config = _config(tmp_path)
-    manifest = run_chain(config)
-
-    budgets = {
-        stage["objective"]: stage["detail"]["token_budget"]
-        for stage in manifest["stages"]
-        if stage["stage"] == STAGE_WIKI
-    }
-    assert budgets[OBJECTIVE_SKIPGRAM] == budgets[OBJECTIVE_CBOW]
-    for stage in manifest["stages"]:
-        if stage["stage"] == STAGE_WIKI:
-            assert stage["detail"]["sized_for_objective"] == OBJECTIVE_SKIPGRAM
+    assert prepared == [tmp_path / "wikipedia-20231101-en.txt"]
+    assert observed == [
+        (objective, [["first", "document"], ["last", "document"]]) for objective in BOTH_OBJECTIVES
+    ]
+    assert (tmp_path / "wikipedia-subset.txt").read_text() == "obsolete subset\n"
 
 
-def test_the_overnight_budget_is_arithmetic_on_measured_numbers():
-    """What a two-objective night costs, so the ceiling can be checked against a night.
-
-    Skip-gram at ``k=5`` moves 138,362 tokens/s and CBOW is 2.224x faster (181,487 against
-    81,603 at ``k=15``). Worked for the Wikipedia stage, 191,271,628 tokens over 5 epochs:
-
-    * Skip-gram: ``191,271,628 x 5 / (138,362 x 0.96) = 7,199 s``, which is its two hours by
-      construction, since that is the number the subset was sized from.
-    * CBOW: the same corpus at 2.224x the rate, so ``7,199 / 2.224 = 3,237 s``, under an hour.
-    """
-    budget = overnight_budget(ChainConfig(), hn_tokens=100_000_000)
-    rows = {(row["objective"], row["stage"]): row for row in budget["stages"]}
-
-    assert rows[(OBJECTIVE_SKIPGRAM, STAGE_WIKI)]["expected_seconds"] == pytest.approx(7_200, abs=5)
-    assert rows[(OBJECTIVE_CBOW, STAGE_WIKI)]["expected_seconds"] == pytest.approx(3_237, abs=5)
-    assert not rows[(OBJECTIVE_CBOW, STAGE_WIKI)]["hits_ceiling"]
-
-    # Eight stages, and the ceilings are per stage per objective.
-    assert len(budget["stages"]) == 8
-    assert budget["ceiling_hours"] == pytest.approx(2 * (0.5 + 2 + 1.5 + 1.5))
-    # The expected total is below the ceiling total, because CBOW finishes early.
-    assert budget["expected_hours"] < budget["ceiling_hours"]
-
-
-def test_a_budget_too_small_to_be_worth_it_stops_for_a_decision(tmp_path, monkeypatch):
-    """Under about 300 MB the Wikipedia variant is barely bigger than text8's 100 MB.
-
-    That is the captain's call, not the chain's, so it reports the number and the levers
-    instead of quietly shipping a small corpus.
-    """
-    monkeypatch.setattr(chain_module, "MEASURED_TOKENS_PER_SECOND", {5: 1_000, 15: 1_000})
-    config = ChainConfig(
-        output_directory=tmp_path / "out",
-        corpus_directory=tmp_path / "corpora",
-        dry_run=False,
-        wikipedia_budget_seconds=60.0,
-    )
-    record = chain_module.RunManifest(config.manifest_path, config, "cpu")
-    outcome = chain_module._run_wikipedia(config, record, OBJECTIVE_SKIPGRAM)
-
-    assert outcome.status == "needs_decision"
-    assert "below" in outcome.notes[0]
-    assert "epochs" in outcome.notes[0], "the note must name the levers"
+@pytest.mark.parametrize("old_lines", [[["alpha", "beta"]] * 5, [["gamma", "delta"]] * 10])
+def test_resume_rejects_a_different_corpus_even_when_matrix_shapes_match(tmp_path, old_lines):
+    """A checkpoint from a limited corpus cannot silently become a full-corpus result."""
+    config = _one_objective(tmp_path, resume=True)
+    stage_config = SGNSConfig(dimension=4, min_count=1)
+    old_vocabulary = build_vocabulary(iter(old_lines), min_count=1, max_size=50)
+    checkpoint = Checkpoint(
+        stage=config.checkpoint_stage(OBJECTIVE_SKIPGRAM, STAGE_WIKI),
+        epochs_done=5,
+        input_matrix=np.zeros((len(old_vocabulary), 4), dtype=np.float32),
+        output_matrix=np.zeros((len(old_vocabulary), 4), dtype=np.float32),
+        vocabulary=old_vocabulary,
+        config_json="{}",
+        epoch_losses=(1.0,) * 5,
+        tokens_read=100,
+    ).save(config.checkpoint_directory)
+    original = checkpoint.read_bytes()
+    manifest = chain_module.RunManifest(config.manifest_path, config, "cpu")
+    record = manifest.start_stage(OBJECTIVE_SKIPGRAM, STAGE_WIKI)
+    with pytest.raises(ValueError, match="differ from the current corpus"):
+        chain_module._train_stage(
+            OBJECTIVE_SKIPGRAM,
+            STAGE_WIKI,
+            lambda: iter([["alpha", "beta"]] * 10),
+            stage_config,
+            config,
+            manifest,
+            record,
+        )
+    assert checkpoint.read_bytes() == original
     assert not config.artefact_path(OBJECTIVE_SKIPGRAM, STAGE_WIKI).exists()
+
+
+def test_runtime_estimates_grow_with_corpus_size_without_clipping():
+    """A large corpus can exceed the former stage and total limits in the estimate."""
+    estimate = estimate_training_time(ChainConfig(), wikipedia_tokens=2_000_000_000)
+    larger = estimate_training_time(ChainConfig(), wikipedia_tokens=4_000_000_000)
+    wiki = lambda result: next(  # noqa: E731
+        row["expected_seconds"]
+        for row in result["stages"]
+        if row["objective"] == OBJECTIVE_SKIPGRAM and row["stage"] == STAGE_WIKI
+    )
+    assert len(estimate["stages"]) == 8
+    assert wiki(estimate) > 7_200
+    assert wiki(larger) == pytest.approx(2 * wiki(estimate), abs=0.2)
+    assert estimate["expected_hours"] > 11
 
 
 def test_fine_tuning_uses_a_lower_rate_and_starts_from_its_own_objective(tmp_path):

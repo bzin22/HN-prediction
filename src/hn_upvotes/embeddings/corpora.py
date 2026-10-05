@@ -9,7 +9,7 @@ Four sources:
 
 * **text8**, the gate corpus. One 100 MB line of lowercase Wikipedia with punctuation
   removed, so it is read in chunks by :func:`~hn_upvotes.data.preprocess.stream_corpus`.
-* **A Wikipedia subset**, sized from measured throughput rather than picked.
+* **English Wikipedia**, read without a corpus-size limit.
 * **Hacker News titles and bodies**, from the cached story table.
 * **A planted-structure synthetic corpus**, which needs no network and is what the dry run
   and the tests use.
@@ -44,14 +44,9 @@ HN_CORPUS_TOKENS = 75_283_676
 #: text8's canonical home. 31 MB zipped, 100 MB unpacked, 17.0M tokens.
 TEXT8_URL = "http://mattmahoney.net/dc/text8.zip"
 
-#: The Wikipedia dump the subset is cut from, read with duckdb over ``hf://`` exactly as
-#: ``data/ingest.py`` reads the Hacker News dump. **This path has not been exercised**: it
-#: needs a download, and the build-only brief forbids one. Treat it as unverified.
+#: English Wikipedia snapshot, read with DuckDB over ``hf://``. Local export tests pass;
+#: the full remote acquisition has not been run. There is no row or token cap.
 WIKIPEDIA_PARQUET_GLOB = "hf://datasets/wikimedia/wikipedia/20231101.en/*.parquet"
-
-#: Bytes per token in English plain text, used only to turn a token budget into a rough
-#: size for the write-up. Measured on text8: 100,000,000 bytes over 17,005,207 tokens.
-BYTES_PER_TOKEN = 5.9
 
 
 def stream_text8(path: Path) -> Iterator[list[str]]:
@@ -103,9 +98,8 @@ def take_tokens(lines: Iterator[list[str]], token_budget: int | None) -> Iterato
 def stream_plain_text(path: Path, token_budget: int | None = None) -> Iterator[list[str]]:
     """A plain-text corpus, one document per line, stopped at ``token_budget`` tokens.
 
-    The budget is the point of the Wikipedia stage: the subset size comes from a measured
-    throughput and a wall-clock ceiling, so the reader takes a token count rather than the
-    caller trimming a file to a guessed size.
+    The training chain reads the entire file. Optional token limits remain available for
+    bounded diagnostic experiments.
     """
     taken = 0
     with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
@@ -122,38 +116,33 @@ def stream_plain_text(path: Path, token_budget: int | None = None) -> Iterator[l
             yield tokens
 
 
-def prepare_wikipedia_subset(destination: Path, token_budget: int) -> Path:
-    """Write a plain-text Wikipedia subset of about ``token_budget`` tokens.
+def prepare_wikipedia_corpus(destination: Path) -> Path:
+    """Export all eligible English Wikipedia articles as one document per line.
 
-    Reads the Hugging Face dump with duckdb over ``hf://``, the same way
-    ``data/ingest.py`` reads the Hacker News dump, and pushes the projection down so only
-    the ``text`` column crosses the network.
-
-    **Not run yet, and this is the one part of the chain that has not been proved.**
-    Exercising it means downloading 1.13 GB, which the build-only brief rules out. The chain's
-    Wikipedia stage will fail here first if the query or the dataset path is wrong, and that
-    failure is contained: stage 3 still produces the ``hn-only`` variant, and the other
-    objective is untouched.
-
-    Written once and read by both objectives, so the CBOW against Skip-gram comparison is not
-    confounded by corpus size. The chain skips this call when the file is already there.
+    Read only the text column, in bounded batches. There is no row or token limit.
+    Keep the existing text filter: exclude null text and articles of 200 characters or less.
+    Publish the file only after the export succeeds, so a failed download cannot look complete.
+    Both objectives reuse this file. Remote acquisition still requires a live validation run.
     """
     import duckdb
 
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    # Rows are far longer than a token, so this asks for a generous multiple and the
-    # reader's own budget does the exact cut.
-    rows = max(int(token_budget / 300), 1)
+    temporary = destination.with_name(destination.name + ".partial")
     query = f"""
         SELECT text
         FROM '{WIKIPEDIA_PARQUET_GLOB}'
         WHERE text IS NOT NULL AND length(text) > 200
-        LIMIT {rows}
     """
-    with destination.open("w", encoding="utf-8") as handle:
-        for (text,) in duckdb.sql(query).fetchall():
-            handle.write(" ".join(str(text).split()) + "\n")
+    try:
+        with duckdb.connect() as connection, temporary.open("w", encoding="utf-8") as handle:
+            reader = connection.execute(query)
+            while rows := reader.fetchmany(10_000):
+                for (text,) in rows:
+                    handle.write(" ".join(str(text).split()) + "\n")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination
 
 
@@ -161,6 +150,7 @@ def stream_hn_text(
     parquet_path: Path = HN_CORPUS_PATH,
     include_bodies: bool = True,
     token_budget: int | None = None,
+    before: str | None = None,
 ) -> Iterator[list[str]]:
     """Hacker News titles, and the bodies where there are any, as separate lines.
 
@@ -175,33 +165,41 @@ def stream_hn_text(
     Titles are about 8 tokens and a body over 1,000 characters is roughly 200 words with
     real sentence structure, which is why the bodies are worth the extra column: a context
     window has something to work with.
+
+    ``before`` is an exclusive UTC date cutoff. Use the validation boundary when the
+    embeddings will be compared on a held-back validation period.
     """
     import duckdb
 
     from hn_upvotes.features.body import strip_html
 
     columns = "title, text" if include_bodies else "title, '' AS text"
-    query = f"SELECT {columns} FROM '{Path(parquet_path)}'"
+    query = f"SELECT {columns} FROM read_parquet(?)"
+    parameters = [str(Path(parquet_path))]
+    if before is not None:
+        query += " WHERE time < CAST(? AS TIMESTAMP)"
+        parameters.append(before)
     taken = 0
-    reader = duckdb.sql(query)
-    while True:
-        chunk = reader.fetchmany(10_000)
-        if not chunk:
-            return
-        for title, body in chunk:
-            lines = [tokenise(normalise_title(title or ""))]
-            if include_bodies and body:
-                lines.append(tokenise(normalise_title(strip_html(body))))
-            for tokens in lines:
-                if not tokens:
-                    continue
-                if token_budget is not None and taken + len(tokens) > token_budget:
-                    remaining = token_budget - taken
-                    if remaining > 0:
-                        yield tokens[:remaining]
-                    return
-                taken += len(tokens)
-                yield tokens
+    with duckdb.connect() as connection:
+        reader = connection.execute(query, parameters)
+        while True:
+            chunk = reader.fetchmany(10_000)
+            if not chunk:
+                return
+            for title, body in chunk:
+                lines = [tokenise(normalise_title(title or ""))]
+                if include_bodies and body:
+                    lines.append(tokenise(normalise_title(strip_html(body))))
+                for tokens in lines:
+                    if not tokens:
+                        continue
+                    if token_budget is not None and taken + len(tokens) > token_budget:
+                        remaining = token_budget - taken
+                        if remaining > 0:
+                            yield tokens[:remaining]
+                        return
+                    taken += len(tokens)
+                    yield tokens
 
 
 def count_hn_tokens(
@@ -209,10 +207,8 @@ def count_hn_tokens(
 ) -> tuple[int, int]:
     """Tokens and lines in the Hacker News corpus, counted rather than estimated.
 
-    The overnight budget rests on this number, and "about eight tokens a title times five
-    million titles" is a guess with a body-text term missing from it. Counting takes a couple
-    of minutes and turns the budget into arithmetic. See
-    :func:`~hn_upvotes.embeddings.chain.overnight_budget`.
+    Count both titles and bodies for runtime estimates. Recount after the input data or
+    training-period filter changes.
     """
     tokens = 0
     lines = 0
@@ -297,7 +293,7 @@ def topic_corpus(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Count the Hacker News corpus and print the number the overnight budget needs."""
+    """Count the Hacker News corpus for runtime estimates."""
     import argparse
 
     parser = argparse.ArgumentParser(description=count_hn_tokens.__doc__.splitlines()[0])
