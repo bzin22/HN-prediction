@@ -2,6 +2,15 @@
 
 This file is the project's committed home for project-intrinsic agent knowledge: build, test, release, architecture, and sharp-edge notes that should travel with the code.
 
+## Explanations
+
+For all explanations, aim for roughly 80% of the way to ASD-STE100 Simplified Technical
+English, rather than full compliance. Treat this as a style preference, not a measured
+compliance score. Use plain words, mostly short sentences, active voice, and one topic per
+paragraph. Define necessary technical terms when first used. Allow natural wording and
+longer sentences when they improve clarity; do not enforce the approved vocabulary or
+strict sentence-length limits. Keep explanations concise unless the user asks for more detail.
+
 ## Toolchain
 
 Plain `venv` and `pip`, no uv. `make setup` builds `.venv` and installs `-e ".[dev]"`.
@@ -200,25 +209,38 @@ compare against. Gate on task scores instead, task supplied by the caller.
 `skipgram.py` must contain nothing but `forward`. A test enforces that, because a duplicated
 sampler is how the CBOW-against-Skip-gram comparison stops meaning anything.
 
-The overnight chain is `embeddings/chain.py`. **Both objectives by default, four stages each,
+The training chain is `embeddings/chain.py`. **Both objectives by default, four stages each,
 six variants**, and `make chain-dry-run` proves all eight on synthetic corpora in about 20 seconds.
 Artefacts are `{objective}-{stage}.npz` and checkpoints `{objective}-{stage}-epoch{n}.npz`, so
 a resume cannot cross objectives and a variant on disk cannot lie about what made it. The two
-objectives share the Wikipedia subset, sized from Skip-gram's throughput because it is the
-slower one; sizing each to its own ceiling would make the comparison about corpus size.
+objectives share the full eligible English Wikipedia corpus. There is no total or per-stage
+time limit and no throughput-derived corpus cap. The default epoch count is five.
 Checkpoints carry **both** matrices, since resuming from the embedding alone restarts scoring
 from zero. A cut-short epoch banks under the previous epoch number and keeps its loss out of
 the per-epoch list, or a resume double-counts it.
 
-A night is **7.5 hours expected against 11.0 hours of ceilings**; `chain.overnight_budget` is
-the arithmetic and `make hn-token-count` is where its 75,283,676-token input comes from. Two
-costs sit outside it and are not measured: gensim's half of each gate, and the Hacker News
-reader's real throughput. If it stops fitting, cut epochs on the HN stages, not an objective.
+`chain.estimate_training_time` estimates runtime from supplied corpus counts; it never stops
+training. The old 7.5-hour estimate covered a limited subset and is no longer applicable.
+`make hn-token-count` recounts HN text. The chain excludes HN rows from the validation
+boundary onward (December 2021). Direct reader calls must supply `before` to apply that filter.
+The full Wikipedia export uses bounded batches and an atomic rename;
+its new filename prevents reuse of an older limited subset.
 
 Embedding tests need the `train` extra, which the base install and the main CI job do not
 carry, so they `importorskip`. The separate `train-extra` CI job installs the CPU torch wheel
 and runs them; without that job they would never run anywhere. Anything else needing that
-extra has to be added to that job by name, or it silently never runs.
+extra has to be added to that job by name, or it silently never runs. The job also installs
+DuckDB for the local Wikipedia export tests.
+
+`embeddings/full_run.py` trains two models on joint Wikipedia and earlier HN text. It runs
+both text8 gates first, interleaves every source document once per epoch, and saves both
+models before deleting its own text files. It requires a fresh run directory. Its `status.json`
+records progress; failed runs retain data and checkpoints. The original HN table is preserved.
+The Wikipedia snapshot is November 2023: it predates the test period, but not validation.
+The August and October 2026 text8 runs failed both gates; full-corpus training has not started.
+The installed gensim 4.4.0 returns zero for a dot product of -1.0 with an ignored exception.
+The reference correction is pending; details are in `docs/word2vec.md`. Do not present its
+comparison scores as a verified correctness reference.
 
 ## Maintaining this file
 

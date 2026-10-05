@@ -22,10 +22,9 @@ below comes from a synthetic corpus or a microbenchmark, and each says which.
 - [Risk 1: sparse gradients](#risk-1-sparse-gradients)
 - [Risk 2: the GPU or the Python](#risk-2-the-gpu-or-the-python)
 - [What the measurements changed](#what-the-measurements-changed)
-- [The overnight chain](#the-overnight-chain)
+- [The training chain](#the-training-chain)
 - [Both objectives, six variants](#both-objectives-six-variants)
-- [Sizing the Wikipedia stage](#sizing-the-wikipedia-stage)
-- [What a night costs](#what-a-night-costs)
+- [Corpus size and runtime](#corpus-size-and-runtime)
 - [The gate](#the-gate)
 - [What is not proved yet](#what-is-not-proved-yet)
 
@@ -228,8 +227,7 @@ of the stable rates on all three.
 ### What the rule is
 
 Two tests on the rate alone, then one comparison, then take the largest survivor. A larger
-rate that converges gets further in the same wall clock, and this project's ceiling is wall
-clock.
+rate that converges makes more progress in the same elapsed time.
 
 1. **It converged.** No seed blew up, and the mean loss fell by at least 5% of the 11.09 that
    a zero output matrix forces at the start. 0.05 fails the first; 0.0025 clears both, barely.
@@ -297,7 +295,7 @@ undo that. It is a cost of batching, so it is reported and not gated.
 Two consequences worth carrying forward. Part of whatever gap the gate sees against gensim is
 this, not a bug, because gensim updates sequentially. And **batch 1024 is still the right
 default**: batch 32 gives up 8.8 points of that gap but takes 6 seconds against 2 for the same
-83,331 examples, and this project's ceiling is wall clock.
+83,331 examples. This is a throughput tradeoff.
 
 The neighbour overlap column says the same thing less kindly. Two runs that reach a similar
 loss do not reach the same matrix: batch 32 agrees with batch 1 on half of each frequent
@@ -409,7 +407,7 @@ rather than assumed.
 
 The other change is the learning rate, [above](#the-learning-rate-is-per-example-and-the-batch-scales-it).
 
-## The overnight chain
+## The training chain
 
 [`chain.py`](../src/hn_upvotes/embeddings/chain.py) runs two objectives in one process, four
 stages each, in order. `make chain-dry-run` walks all eight on synthetic corpora in about 20 seconds.
@@ -454,10 +452,8 @@ run reports `already_complete` for all six variants and trains nothing.
 Two things are deliberately shared, and sharing them is what makes the comparison a
 comparison:
 
-* **The same Wikipedia subset, sized from Skip-gram's throughput.** Skip-gram is the slower
-  objective, so the subset fits its two-hour ceiling and CBOW finishes the same corpus early.
-  Sizing each objective to fill its own two hours would hand CBOW 2.2x the corpus and the
-  comparison would be measuring corpus size.
+* **The same English Wikipedia corpus.** Both objectives read the same snapshot without
+  a token cap. Throughput affects estimated runtime, not corpus size.
 * **Everything in `SGNSConfig` except the objective**, including the seed. A test asserts the
   two stage configs are equal once the objective field is blanked.
 
@@ -495,11 +491,9 @@ Unattended operation needs six things beyond training, and each is tested:
   the modification time so a restored file cannot look newest.
 - **Failure isolation.** A stage that raises is recorded with its traceback and the next stage
   still runs. The gate is the deliberate exception.
-- **A wall-clock budget per stage.** It stops between batches, saves, and returns with
-  `cut_short` set. A cut-short epoch banks its progress under the *previous* epoch number so a
-  resume repeats that epoch rather than skipping the part it never did, and its loss is kept
-  out of the per-epoch list so the count cannot drift. That drift was a real bug found here: a
-  resumed stage reported 4 epochs completed out of 3.
+- **No total or per-stage time limit.** Every stage runs its configured number of epochs.
+  Checkpoints from earlier runs that stopped mid-epoch remain resumable. The lower-level
+  trainer retains an optional deadline for explicit diagnostic tests; the chain supplies none.
 - **One JSON manifest**, rewritten atomically after every state change, holding the effective
   settings, each stage's status, throughput, per-epoch losses, and any failure with its
   traceback. A night is readable from one file.
@@ -509,77 +503,39 @@ Unattended operation needs six things beyond training, and each is tested:
 A run that was cut short reports `partial`, never `completed`. Reporting otherwise is exactly
 what the flag exists to prevent.
 
-## Sizing the Wikipedia stage
+## Corpus size and runtime
 
-The ceiling is two hours and the subset is computed to fit it, rather than picked and then
-timed. From the measured 138,362 tokens/s at `k = 5`, times the 0.96 large-vocabulary factor,
-over a 7,200 second ceiling, divided by 5 epochs because every epoch rereads the whole subset:
+The chain uses the English Wikipedia `20231101.en` snapshot without a row or token cap.
+Both objectives read the same exported file. The existing text filter excludes null text
+and articles of 200 characters or less. The exporter reads bounded batches and publishes
+the file only after a successful export. An older limited subset is not reused.
 
-```
-138,362 x 0.96 x 7,200 / 5 = 191,271,628 tokens
-```
+Source sizes, checked on 2026-10-02, use decimal GB:
 
-At 5.9 bytes per token, measured on text8, that is **about 1.13 GB**, comfortably above the
-300 MB floor below which the variant would be barely larger than text8 and the stage would
-have lost its point. If a future measurement puts it under that floor the chain stops and
-reports the number with the levers rather than shrinking the corpus quietly.
+| Dataset | Size | What the size includes |
+|---|---:|---|
+| English Wikipedia `20231101.en` | 11.63 GB | Compressed source download |
+| English Wikipedia `20231101.en` | 20.20 GB | Prepared records, including ID, URL, title, and text |
+| HN source archive | 12.4 GB | Published files, including stories and comments; the archive grows |
+| Project HN story table | 0.365 GB | Local filtered Parquet file; 364,726,874 bytes, checked on 2026-10-02 |
 
-One derived estimate did not survive measurement. `k = 5` costs 6 dot products per pair against
-`k = 15`'s 16, which predicts 2.7x the throughput. **Measured, it is 1.80x**: 138,362 against
-77,019 tokens/s. The difference is fixed per-batch overhead that does not scale with `k`.
+Sources: [Wikipedia metadata](https://huggingface.co/datasets/wikimedia/wikipedia/blob/main/README.md)
+and [HN dataset](https://huggingface.co/datasets/open-index/hacker-news).
+The exact size of the exported Wikipedia text file is not yet measured.
 
-## What a night costs
+There is no total or per-stage time limit. The former 7.5-hour estimate and 11-hour sum of
+stage limits applied to a planned 191M-token Wikipedia subset. They do not apply to the
+full snapshot. The epoch count remains explicit and defaults to five.
 
-Two objectives is not two nights. **7.5 hours expected, 11.0 hours of ceilings**, so it fits
-a night with room, and no stage is expected to hit its own ceiling.
+`chain.estimate_training_time` accepts corpus token counts and estimates elapsed training
+time from the measured throughput. It does not cap a run or reduce a corpus. Count the full
+Wikipedia corpus before quoting a new runtime. The recorded HN count is 75,283,676 tokens;
+it includes later text and must be recalculated with the training-period cutoff.
 
-The HN corpus is counted rather than guessed: `make hn-token-count` reports **75,283,676
-tokens over 5,091,739 lines**, 14.8 tokens a line. The bodies are half of it. 4,739,207 titles
-at about 8 tokens is 38M, so the 352,532 lines of body text carry the rest on 7% of the rows.
-
-`overnight_budget` in [`chain.py`](../src/hn_upvotes/embeddings/chain.py) is the arithmetic,
-at 5 epochs, with the ceiling shown next to it:
-
-| Objective | Stage | Corpus tokens | Expected | Ceiling |
-|---|---|---:|---:|---:|
-| Skip-gram | gate | 17,005,207 | 19.2 min | 30 min |
-| Skip-gram | wiki-only | 191,271,628 | 120.0 min | 120 min |
-| Skip-gram | fine-tuned | 75,283,676 | 84.8 min | 90 min |
-| Skip-gram | hn-only | 75,283,676 | 84.8 min | 90 min |
-| CBOW | gate | 17,005,207 | 8.6 min | 30 min |
-| CBOW | wiki-only | 191,271,628 | 54.0 min | 120 min |
-| CBOW | fine-tuned | 75,283,676 | 38.2 min | 90 min |
-| CBOW | hn-only | 75,283,676 | 38.2 min | 90 min |
-| | **total** | | **7.46 h** | **11.0 h** |
-
-CBOW is the cheap half at 2.3 hours against Skip-gram's 5.2, because it is 2.224x faster per
-corpus token (181,487 against 81,603 measured at dimension 300, `k = 15`). Skip-gram's
-Wikipedia stage lands exactly on its two hours because that is the number the subset was sized
-from, and CBOW then reads the same subset in 54 minutes.
-
-Worked, for the Skip-gram Wikipedia stage: `191,271,628 tokens x 5 epochs / (138,362 x 0.96
-tokens/s) = 7,199 s`. For CBOW, the same corpus at 2.224x the rate: `7,199 / 2.224 = 3,237 s`.
-
-**Three costs are outside that table and one of them could matter.**
-
-1. **gensim's half of each gate.** The gate trains gensim on text8 as well as us, and only our
-   side is under the budget. Unmeasured on text8. The one measurement in hand is from the dry
-   run's synthetic corpus, where gensim managed 102,198 tokens/s against our 96,474, and its
-   Cython should do better on text8 than that. At 100,000 tokens/s it is 14 minutes per
-   objective, 28 for both.
-2. **The vocabulary pass.** Every stage counts its corpus once before training, and the
-   training loop then rereads it once per epoch. For the four HN stages that is a duckdb read
-   plus HTML stripping plus tokenisation, six times each, and the 77,019 tokens/s figure was
-   measured on an in-memory synthetic corpus rather than on that reader. **This is the number
-   most likely to be wrong**, and it is wrong in the direction of the night taking longer.
-3. **The Wikipedia download.** 1.13 GB over `hf://`, once, before Skip-gram's stage 1. CBOW
-   reuses the file.
-
-If the total does not fit, **the thing to cut is epochs on the HN stages, not an objective**.
-Dropping the four HN stages from 5 epochs to 3 saves 98 minutes and keeps all six variants,
-where dropping CBOW saves 2.3 hours and cancels the experiment the phase exists to run. The
-second lever is the Wikipedia ceiling: it is a ceiling and the subset is sized from it, so
-`--wikipedia-hours 1.5` shrinks the corpus and saves 45 minutes across both objectives.
+The estimate excludes downloads, vocabulary preparation, evaluation, and reader overhead.
+Gensim's gate-training runtime can be supplied separately. Real HN reader throughput has
+not been measured against the synthetic throughput benchmark. No full corpus download or
+training run was performed when the limits were removed.
 
 ## The gate
 
@@ -630,14 +586,22 @@ not a claim about text8, where its Cython should pull ahead.
 
 Stated plainly, because the rest of this note is measured and these are not.
 
-- **No variant has been produced.** Wikipedia and Hacker News have not been trained on, and
-  none of the six artefacts exists. text8 has been trained on only for the two hyperparameter
-  measurements, at 5M and 120k tokens, never a full run and never through the chain.
-- **The gate has never run on text8.** Both objectives pass it on the synthetic dry-run
-  corpus, which is not the same claim.
-- **The Wikipedia acquisition path has never run.** `prepare_wikipedia_subset` reads the
+- **No full-corpus variant has been produced.** An August 2026 cached run trained both
+  objectives on text8, but both gates failed. Skip-gram failed neighbour overlap; CBOW
+  failed overlap and the analogy comparison. Logs also contain a gensim warning.
+  The October 2, 2026 repeat also stopped at both gates after 44 minutes. No full Wikipedia
+  or HN training started. Skip-gram neighbour overlap was 14.45%; CBOW overlap was 12.40%,
+  against a 15% floor. CBOW analogy accuracy was 0.617% against gensim's 1.071%.
+  The joint-corpus runner stops before acquisition if either gate fails.
+- **The installed gensim 4.4.0 reference has a confirmed calculation error.** A direct call
+  to its compiled `our_dot_float` returned zero for a valid dot product of -1.0 and emitted
+  the same ignored-exception message as the training log. Inputs yielding -0.5 and -2.0
+  returned the correct values. The `sdot_ptr` and `dsdot_ptr` declarations use `except -1`.
+  The effect on the reference scores is unmeasured. No correction or replacement reference
+  has been implemented, and the acceptance rules have not been relaxed.
+- **The Wikipedia acquisition path has never run.** `prepare_wikipedia_corpus` reads the
   Hugging Face dump with duckdb over `hf://`, the same way `data/ingest.py` reads the HN dump,
-  but exercising it means downloading 1.13 GB. If the query or the dataset path is wrong,
+  but the full English snapshot has not been downloaded here. If the query or the dataset path is wrong,
   stage 1 fails there first, and that failure is contained: stage 3 still produces `hn-only`,
   and the other objective is untouched.
 - **The gate thresholds are calibrated on synthetic corpora**, where a correct implementation
@@ -646,9 +610,10 @@ Stated plainly, because the rest of this note is measured and these are not.
 - **The intrinsic scores in the sweep are floor-level and are used only to rank.** WordSim-353
   at 0.079 and analogy accuracy at 0.00028 are what 5M tokens and one epoch buy; the paper
   trains on 20x that. They separate the rates and they are not a claim about the vectors.
-- **`gensim`'s half of the gate has not been timed on text8**, so the overnight budget has an
-  unmeasured 28 minutes in it. So does the Hacker News reader's throughput, which is the
-  larger of the two unknowns: the 77,019 tokens/s the budget uses was measured on an
-  in-memory synthetic corpus, not on duckdb plus HTML stripping plus tokenisation.
+- **The runtime estimate is incomplete.** Gensim throughput was recorded in the October
+  gate run, but its calculation error limits that reference. Supply its duration explicitly
+  to the estimator; the default excludes it. HN reader throughput is also unmeasured:
+  the 77,019 tokens/s benchmark used an in-memory synthetic corpus, not DuckDB reads,
+  HTML stripping, and tokenisation.
 - **`CBOW_SPEEDUP` was measured at `k = 15`, not at the `k = 5` the Wikipedia stage uses.** It
   is used only to estimate how long CBOW's stages take, never to size a corpus.

@@ -55,11 +55,11 @@ jobs:
       # The CPU wheel, because there is no GPU on a runner and the CUDA build is 2 GB.
       - name: Install with the train extra
         run: |
-          pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev,train]"
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev,train]" "duckdb>=1.0"
 
       # xgboost's Linux wheel bundles its own OpenMP runtime, so the early stopping tests
       # run here without the libomp workaround `make tune-xgboost` needs on macOS.
       - name: Test the embeddings and the early stopped rung
         run: |
-          pytest -v tests/test_embeddings_sgns.py tests/test_embeddings_chain.py \
-            tests/test_learning_rate.py tests/test_early_stopped_xgboost.py
+          pytest -v tests/test_embeddings_sgns.py tests/test_embeddings_chain.py tests/test_embeddings_corpora.py \
+            tests/test_embeddings_full_run.py tests/test_learning_rate.py tests/test_early_stopped_xgboost.py
